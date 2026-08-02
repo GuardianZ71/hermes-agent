@@ -862,6 +862,60 @@ class TestSharedBoardPaths:
 
 
 # ---------------------------------------------------------------------------
+# Respawn guard
+# ---------------------------------------------------------------------------
+
+
+def test_respawn_guard_active_pr_in_comment(kanban_home):
+    """A recent PR comment guards against an accidental duplicate worker."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "Opened https://github.com/example/repo/pull/42",
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_active_pr_bypassed_by_later_requeue(kanban_home):
+    """A dependency promotion after PR review deliberately resumes the task."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fix-review", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/42", now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (task_id, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_respawn_guard_requeue_before_pr_does_not_bypass(kanban_home):
+    """Only a requeue after the latest PR comment bypasses the guard."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="still-has-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (task_id, now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/43", now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+# ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------
 
