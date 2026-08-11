@@ -7,6 +7,30 @@ sidebar_position: 5
 
 # Browser Automation
 
+Hermes uses **Stagehand v4** as the default driver for model-facing browser
+tools. Stagehand is built for browser agents and adds compact accessibility
+snapshots plus self-healing actions while preserving the existing
+`browser_navigate`, `browser_snapshot`, `browser_click`, and related tool
+interfaces. Playwright remains in the repository for desktop/Electron E2E
+tests; it is no longer the default agent browsing runtime.
+
+```yaml
+browser:
+  driver: stagehand             # rollback: agent-browser
+  stagehand:
+    model: openai/gpt-5-mini
+    self_heal: true
+    fallback_to_agent_browser: true
+```
+
+Deterministic Stagehand actions and snapshots do not require an LLM key. To
+enable natural-language self-healing, set a browser-scoped
+`STAGEHAND_OPENAI_API_KEY`. Hermes does not expose its general provider
+keyring to the Node sidecar. Local Chrome and cloud CDP sessions use the same
+Stagehand driver. Unsupported legacy operations can fall back to
+`agent-browser`; set `fallback_to_agent_browser: false` for strict Stagehand
+mode.
+
 Hermes Agent includes a full browser automation toolset with multiple backend options:
 
 - **Browserbase cloud mode** via [Browserbase](https://browserbase.com) for managed cloud browsers and anti-bot tooling

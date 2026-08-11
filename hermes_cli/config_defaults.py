@@ -408,6 +408,15 @@ DEFAULT_CONFIG = {
     },
 
     "browser": {
+        # Agent browser driver. Stagehand v4 is purpose-built for agents;
+        # ``agent-browser`` remains available as an explicit rollback.
+        "driver": "stagehand",  # stagehand | agent-browser
+        "stagehand": {
+            "model": "openai/gpt-5-mini",
+            "self_heal": True,
+            "dom_settle_timeout_ms": 3000,
+            "fallback_to_agent_browser": True,
+        },
         # Browser tool implementation.
         # ""            — DEFAULT: Browser Use mode when the browser-use CLI
         #                 (or uvx) is available; otherwise the built-in
@@ -3780,6 +3789,15 @@ OPTIONAL_ENV_VARS = {
         "tools": ["browser_navigate", "browser_click"],
         "password": False,
         "category": "tool",
+    },
+    "STAGEHAND_OPENAI_API_KEY": {
+        "description": "Browser-scoped OpenAI key for optional Stagehand self-healing actions",
+        "prompt": "Stagehand OpenAI API key",
+        "url": "https://platform.openai.com/api-keys",
+        "tools": ["browser_navigate", "browser_snapshot", "browser_click"],
+        "password": True,
+        "category": "tool",
+        "advanced": True,
     },
     "BROWSER_USE_API_KEY": {
         "description": "Browser Use API key for cloud browser (optional — local browser works without this)",

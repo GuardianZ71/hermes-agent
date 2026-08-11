@@ -119,6 +119,9 @@ _BROWSER_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "FIRECRAWL_API_KEY",
     "FIRECRAWL_API_URL",
     "FIRECRAWL_BROWSER_TTL",
+    # Deliberately separate from Hermes' general OPENAI_API_KEY.  The
+    # Stagehand npm sidecar receives only this browser-scoped credential.
+    "STAGEHAND_OPENAI_API_KEY",
 )
 
 
@@ -2469,6 +2472,65 @@ def _run_browser_command(
         timeout = _safe_command_timeout()
     args = args or []
 
+    # Stagehand v4 is the default model-facing browser driver.  Keep this at
+    # the edge of the existing command dispatcher so the public browser_*
+    # schemas, URL policy, redaction, cloud-provider lifecycle, and task
+    # isolation remain unchanged.  ``agent-browser`` is retained as an
+    # explicit rollback and as a bounded fallback while Stagehand support is
+    # rolled out across platforms.
+    try:
+        from hermes_cli.config import read_raw_config
+        browser_cfg = (read_raw_config() or {}).get("browser", {})
+        if not isinstance(browser_cfg, dict):
+            browser_cfg = {}
+    except Exception:
+        browser_cfg = {}
+    # Configs created after this change carry ``driver: stagehand`` from
+    # DEFAULT_CONFIG. Older hand-authored configs without the key retain the
+    # legacy driver until migrated, avoiding a surprise runtime switch.
+    driver = str(browser_cfg.get("driver", "agent-browser") or "agent-browser").strip().lower()
+    stagehand_cfg = browser_cfg.get("stagehand", {})
+    if not isinstance(stagehand_cfg, dict):
+        stagehand_cfg = {}
+    allow_fallback = bool(stagehand_cfg.get("fallback_to_agent_browser", True))
+
+    if driver == "stagehand":
+        try:
+            from tools import stagehand_driver
+            if stagehand_driver.package_available() and stagehand_driver.supports(command, args):
+                session_info = _get_session_info(task_id)
+                env = _build_browser_env()
+                env["PATH"] = _merge_browser_path(env.get("PATH", ""))
+                scoped_key = os.environ.get("STAGEHAND_OPENAI_API_KEY")
+                if scoped_key:
+                    env["STAGEHAND_OPENAI_API_KEY"] = scoped_key
+                config = {
+                    "backend": "cdp" if session_info.get("cdp_url") else "local",
+                    "cdpUrl": session_info.get("cdp_url", ""),
+                    "headed": _is_headed_mode(),
+                    "model": str(stagehand_cfg.get("model", "openai/gpt-5-mini")),
+                    "selfHeal": bool(stagehand_cfg.get("self_heal", True)),
+                    "domSettleTimeoutMs": int(stagehand_cfg.get("dom_settle_timeout_ms", 3000)),
+                }
+                return stagehand_driver.request(
+                    task_id or "default", command, args, config, env, float(timeout)
+                )
+            if not allow_fallback:
+                reason = (
+                    "Stagehand v4 package is unavailable"
+                    if not stagehand_driver.package_available()
+                    else f"Stagehand does not support browser command '{command}'"
+                )
+                return {"success": False, "error": reason}
+        except Exception as exc:
+            logger.warning(
+                "Stagehand browser command '%s' failed for task=%s: %s",
+                command, task_id, exc, exc_info=True,
+            )
+            if not allow_fallback:
+                return {"success": False, "error": f"Stagehand failed: {exc}"}
+            logger.info("Falling back to agent-browser for command '%s'", command)
+
     # Build the command
     try:
         browser_cmd = _find_agent_browser()
@@ -4606,6 +4668,14 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     # before the backend tears down the underlying CDP endpoint.
     _stop_cdp_supervisor(task_id)
 
+    # Stagehand owns a persistent Node sidecar (and, in local mode, Chrome).
+    # Reap it before closing the provider CDP endpoint underneath it.
+    try:
+        from tools import stagehand_driver
+        stagehand_driver.close(task_id)
+    except Exception as e:
+        logger.debug("Stagehand cleanup for task %s: %s", task_id, e)
+
     # Also clean up Camofox session if running in Camofox mode.
     # Skip full close when managed persistence is enabled — the browser
     # profile (and its session cookies) must survive across agent tasks.
@@ -4698,6 +4768,12 @@ def cleanup_all_browsers() -> None:
         task_ids = list(_active_sessions.keys())
     for task_id in task_ids:
         cleanup_browser(task_id)
+
+    try:
+        from tools import stagehand_driver
+        stagehand_driver.close_all()
+    except Exception:
+        pass
 
     # Tear down CDP supervisors for all tasks so background threads exit.
     try:
@@ -4930,6 +5006,27 @@ def check_browser_requirements() -> bool:
     # Camofox backend — only needs the server URL, no agent-browser CLI
     if _is_camofox_mode():
         return True
+
+    # Stagehand is a repository dependency and launches local Chrome itself or
+    # attaches to the existing cloud-provider CDP session. Do not incorrectly
+    # hide the browser tools just because the legacy agent-browser CLI is
+    # absent. Older configs without ``driver`` continue through the legacy
+    # checks below.
+    try:
+        from hermes_cli.config import read_raw_config
+        browser_cfg = (read_raw_config() or {}).get("browser", {})
+        driver = str(browser_cfg.get("driver", "agent-browser")).strip().lower()
+    except Exception:
+        driver = "agent-browser"
+    if driver == "stagehand":
+        try:
+            from tools import stagehand_driver
+            if not stagehand_driver.package_available():
+                return False
+        except Exception:
+            return False
+        provider = _get_cloud_provider()
+        return provider is None or provider.is_configured()
 
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
