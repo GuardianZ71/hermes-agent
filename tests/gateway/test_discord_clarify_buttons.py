@@ -234,6 +234,37 @@ class TestDiscordSendClarify:
         assert len(kwargs["view"].children) == 4
 
     @pytest.mark.asyncio
+    async def test_multi_choice_summary_lists_complete_options(self):
+        adapter = _make_adapter(allowed_users={"42"})
+        channel = MagicMock()
+        sent_msg = MagicMock()
+        sent_msg.id = 123457
+        channel.send = AsyncMock(return_value=sent_msg)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+        choices = [
+            "No-spend continuity: keep the $0 cap, reduce duplicate CI, and use a local runner whenever hosted minutes are exhausted",
+            "Workflow optimization only: keep the $0 cap; GitHub CI may pause briefly while local verification continues",
+            "Allow paid GitHub Actions overage so hosted CI never stops",
+        ]
+
+        await adapter.send_clarify(
+            chat_id="9001",
+            question="Which CI policy should every agent follow?",
+            choices=choices,
+            clarify_id="cidFull",
+            session_key="sk-Full",
+        )
+
+        kwargs = channel.send.call_args.kwargs
+        summary = kwargs["embed"].fields[0]["value"]
+        plain_content = kwargs["content"]
+        for index, choice in enumerate(choices, start=1):
+            numbered_choice = f"{index}. {choice}"
+            assert numbered_choice in summary
+            assert numbered_choice in plain_content
+        assert "…" not in summary
+
+    @pytest.mark.asyncio
     async def test_open_ended_omits_view(self):
         adapter = _make_adapter()
         channel = MagicMock()

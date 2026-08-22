@@ -7682,9 +7682,16 @@ class DiscordAdapter(BasePlatformAdapter):
             clean_choices = clean_choices[:24]
 
             if clean_choices:
+                choice_summary = "\n".join(
+                    f"{index}. {choice}"
+                    for index, choice in enumerate(clean_choices, start=1)
+                )
                 embed.add_field(
                     name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
+                    value=(
+                        f"{choice_summary}\n\n"
+                        "Pick one below, or click ✏️ Other to type a custom answer."
+                    ),
                     inline=False,
                 )
                 view = ClarifyChoiceView(
@@ -7694,6 +7701,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     allowed_role_ids=self._allowed_role_ids,
                 )
             else:
+                choice_summary = ""
                 embed.add_field(
                     name="Reply",
                     value="Reply in this channel with your answer.",
@@ -7701,15 +7709,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 view = None
 
-            # Mirror the question in plain content — embeds are invisible on
-            # some clients (see send_exec_approval).
+            # Mirror the question and the complete option text in plain content —
+            # embeds are invisible on some clients, and Discord button labels are
+            # necessarily shortened to the platform's 80-character limit.
+            clarify_body = str(question or "").strip()
+            if clean_choices:
+                clarify_body = f"{clarify_body}\n\n**Options**\n{choice_summary}"
             clarify_tail = (
                 "\n\nPick one below, or click ✏️ Other to type a custom answer."
                 if clean_choices
                 else "\n\nReply in this channel with your answer."
             )
             content = self._self_contained_prompt_content(
-                "❓ **Hermes needs your input**", str(question or "").strip(),
+                "❓ **Hermes needs your input**", clarify_body,
                 tail=clarify_tail,
             )
             msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
