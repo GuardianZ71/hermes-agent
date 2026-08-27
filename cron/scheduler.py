@@ -342,6 +342,38 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+def _cron_failure_delivery_enabled() -> bool:
+    """Return whether failed cron runs may notify chat delivery targets.
+
+    ``cron.failure_delivery`` defaults to ``chat`` for backward compatibility.
+    Set it to ``local`` to keep failures in cron output, execution state, and
+    logs without sending technical diagnostics to the job's success channel.
+    Successful job output is unaffected.
+    """
+    try:
+        config = load_config() or {}
+        cron_config = config.get("cron") if isinstance(config, dict) else None
+        raw = (
+            cron_config.get("failure_delivery", "chat")
+            if isinstance(cron_config, dict)
+            else "chat"
+        )
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() not in {
+            "0",
+            "disabled",
+            "false",
+            "local",
+            "no",
+            "none",
+            "off",
+            "silent",
+        }
+    except Exception:
+        return True
+
+
 def _upsert_incident_for_failure(
     job: dict, error: str, *, output_file: Optional[Any] = None
 ) -> tuple[bool, Optional[str]]:
@@ -7045,6 +7077,8 @@ def _run_one_job_body(
             should_deliver = bool(deliver_content.strip())
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
+            if not success and not _cron_failure_delivery_enabled():
+                should_deliver = False
             unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
@@ -7215,6 +7249,7 @@ def _run_one_job_body(
             and not delivery_attempted
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
+            and _cron_failure_delivery_enabled()
         ):
             normalized_deliver = _normalize_deliver_value(
                 job.get("deliver", "local")

@@ -78,6 +78,27 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_run_one_job_failure_respects_local_failure_delivery(monkeypatch):
+    """Normal failed runs stay local while successful output remains deliverable."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=False,
+        output="failure details",
+        final="",
+        error="provider failed",
+    )
+    monkeypatch.setattr(
+        s, "load_config", lambda: {"cron": {"failure_delivery": "local"}}
+    )
+    monkeypatch.setattr(
+        s, "_upsert_incident_for_failure", lambda *_a, **_kw: (False, None)
+    )
+
+    assert s.run_one_job({"id": "j-local-normal", "deliver": "telegram"}) is True
+    assert [call[0] for call in calls] == ["run_job", "save", "mark"]
+    assert calls[-1] == ("mark", "j-local-normal", False)
+
+
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     """An exception escaping the run body must not become a silent error row."""
     delivered = []
@@ -128,6 +149,58 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
                 "success": False,
                 "error": "Gemini HTTP 503 (UNAVAILABLE)",
                 "delivery_outcome": "delivered",
+            },
+        )
+    ]
+
+
+def test_run_one_job_exception_respects_local_failure_delivery(monkeypatch):
+    """cron.failure_delivery=local keeps failures in logs/output only."""
+    delivered = []
+    marked = []
+    finished = []
+
+    monkeypatch.setattr(
+        s, "create_execution", lambda *_a, **_kw: {"id": "exec-local-failure"}
+    )
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("provider failed")),
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda *_a, **_kw: delivered.append(True) or None,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        s, "load_config", lambda: {"cron": {"failure_delivery": "local"}}
+    )
+
+    assert s.run_one_job({"id": "j-local", "deliver": "telegram"}) is False
+    assert delivered == []
+    assert marked == [
+        (("j-local", False, "provider failed"), {"delivery_error": None})
+    ]
+    assert finished == [
+        (
+            ("exec-local-failure",),
+            {
+                "success": False,
+                "error": "provider failed",
+                "delivery_outcome": "suppressed",
             },
         )
     ]
