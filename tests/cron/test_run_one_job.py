@@ -99,6 +99,37 @@ def test_run_one_job_failure_respects_local_failure_delivery(monkeypatch):
     assert calls[-1] == ("mark", "j-local-normal", False)
 
 
+def test_run_one_job_failure_routes_to_configured_repair_bot(monkeypatch):
+    """A failed run goes to the repair bot, not the job's success channel."""
+    calls = _patch_pipeline(
+        monkeypatch,
+        success=False,
+        output="failure details",
+        final="",
+        error="provider failed",
+    )
+    delivered = []
+    monkeypatch.setattr(
+        s, "load_config", lambda: {"cron": {"failure_delivery": "bot-chat:default"}}
+    )
+    monkeypatch.setattr(
+        s, "_upsert_incident_for_failure", lambda *_a, **_kw: (False, None)
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, content, **_kw: delivered.append((job["deliver"], content)) or None,
+    )
+
+    assert s.run_one_job(
+        {"id": "j-repair", "name": "repair me", "deliver": "discord:brief"}
+    ) is True
+    assert delivered == [
+        ("bot-chat:default", "⚠️ Cron 'repair me' failed: provider failed")
+    ]
+    assert calls[-1] == ("mark", "j-repair", False)
+
+
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     """An exception escaping the run body must not become a silent error row."""
     delivered = []
@@ -204,6 +235,50 @@ def test_run_one_job_exception_respects_local_failure_delivery(monkeypatch):
             },
         )
     ]
+
+
+def test_run_one_job_exception_routes_to_configured_repair_bot(monkeypatch):
+    """Escaped failures use the same dedicated repair-bot route."""
+    delivered = []
+    marked = []
+    finished = []
+
+    monkeypatch.setattr(
+        s, "create_execution", lambda *_a, **_kw: {"id": "exec-repair-failure"}
+    )
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("scheduler failed")),
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, content, **_kw: delivered.append((job["deliver"], content)) or None,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        s, "load_config", lambda: {"cron": {"failure_delivery": "bot-chat:default"}}
+    )
+
+    assert s.run_one_job(
+        {"id": "j-repair-exc", "name": "repair exception", "deliver": "discord:intel"}
+    ) is False
+    assert delivered == [
+        ("bot-chat:default", "⚠️ Cron 'repair exception' failed: scheduler failed")
+    ]
+    assert finished[-1][1]["delivery_outcome"] == "delivered"
 
 
 def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch):

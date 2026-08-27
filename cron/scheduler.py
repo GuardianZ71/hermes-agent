@@ -342,13 +342,15 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
-def _cron_failure_delivery_enabled() -> bool:
-    """Return whether failed cron runs may notify chat delivery targets.
+def _cron_failure_delivery_job(job: dict) -> Optional[dict]:
+    """Return the delivery view to use for a failed run.
 
-    ``cron.failure_delivery`` defaults to ``chat`` for backward compatibility.
-    Set it to ``local`` to keep failures in cron output, execution state, and
-    logs without sending technical diagnostics to the job's success channel.
-    Successful job output is unaffected.
+    ``cron.failure_delivery`` supports three modes:
+
+    - ``chat`` (default) or a true value: use the job's normal success target;
+    - ``local``/``off``/a false value: keep the failure in local state only;
+    - any other delivery token (for example ``bot-chat:default``): route the
+      failure to that target without changing where successful runs go.
     """
     try:
         config = load_config() or {}
@@ -358,20 +360,36 @@ def _cron_failure_delivery_enabled() -> bool:
             if isinstance(cron_config, dict)
             else "chat"
         )
-        if isinstance(raw, bool):
-            return raw
-        return str(raw).strip().lower() not in {
-            "0",
-            "disabled",
-            "false",
-            "local",
-            "no",
-            "none",
-            "off",
-            "silent",
-        }
     except Exception:
-        return True
+        raw = "chat"
+
+    if isinstance(raw, bool):
+        return job if raw else None
+
+    value = str(raw).strip()
+    lowered = value.lower()
+    if lowered in {
+        "0",
+        "disabled",
+        "false",
+        "local",
+        "no",
+        "none",
+        "off",
+        "silent",
+    }:
+        return None
+    if lowered in {"1", "chat", "enabled", "on", "true", "yes"} or not value:
+        return job
+
+    routed_job = dict(job)
+    routed_job["deliver"] = value
+    return routed_job
+
+
+def _cron_failure_delivery_enabled() -> bool:
+    """Return whether failed cron runs have any configured delivery route."""
+    return _cron_failure_delivery_job({}) is not None
 
 
 def _upsert_incident_for_failure(
@@ -6855,6 +6873,9 @@ def _run_one_job_body(
         execution_id = create_execution(job["id"], source="direct")["id"]
     delivery_attempted = False
     delivery_error = None
+    # Successful output uses the job's ordinary target. Failed output may use
+    # a dedicated operations/repair route from cron.failure_delivery.
+    delivery_job = job
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
     # set on the failure paths below; consumed by the delivery_outcome
     # computation and the post-delivery "alerted" transition.
@@ -7077,8 +7098,12 @@ def _run_one_job_body(
             should_deliver = bool(deliver_content.strip())
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
-            if not success and not _cron_failure_delivery_enabled():
-                should_deliver = False
+            if not success:
+                failure_delivery_job = _cron_failure_delivery_job(job)
+                if failure_delivery_job is None:
+                    should_deliver = False
+                else:
+                    delivery_job = failure_delivery_job
             unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
@@ -7099,8 +7124,8 @@ def _run_one_job_body(
 
             if should_deliver:
                 unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                    _normalize_deliver_value(delivery_job.get("deliver", "local")) == "origin"
+                    and not _resolve_delivery_targets(delivery_job)
                 )
                 try:
                     with _side_effect_fence() as owns_delivery:
@@ -7108,7 +7133,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            delivery_job,
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
@@ -7199,7 +7224,9 @@ def _run_one_job_body(
                 error="Fire claim ownership lost before terminal completion.",
             )
             return True
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        normalized_deliver = _normalize_deliver_value(
+            delivery_job.get("deliver", "local")
+        )
         if delivery_error:
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:
@@ -7244,15 +7271,16 @@ def _run_one_job_body(
         # transport-cancelled worker) must not send a failure alert on top of
         # the replacement run's own delivery — fall through silently and let
         # the fenced bookkeeping below decide what (if anything) to record.
+        failure_delivery_job = _cron_failure_delivery_job(job)
         if (
             isinstance(e, Exception)
             and not delivery_attempted
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
-            and _cron_failure_delivery_enabled()
+            and failure_delivery_job is not None
         ):
             normalized_deliver = _normalize_deliver_value(
-                job.get("deliver", "local")
+                failure_delivery_job.get("deliver", "local")
             )
             unresolved_origin = False
             # Durable failure incident: same ack gate as the normal failure
@@ -7267,7 +7295,7 @@ def _run_one_job_body(
                 try:
                     delivery_attempted = True
                     delivery_error = _deliver_result(
-                        job,
+                        failure_delivery_job,
                         # Composed exactly like the normal failure delivery above.
                         # mark_job_run below records THIS run in failure_streak
                         # whichever layer failed, so a job that fails before the
@@ -7285,7 +7313,9 @@ def _run_one_job_body(
                         "Delivery failed for job %s: %s", job["id"], delivery_exc
                     )
                 if not delivery_error and normalized_deliver == "origin":
-                    unresolved_origin = not _resolve_delivery_targets(job)
+                    unresolved_origin = not _resolve_delivery_targets(
+                        failure_delivery_job
+                    )
                 if delivery_error:
                     delivery_outcome = "failed"
                 elif unresolved_origin:
