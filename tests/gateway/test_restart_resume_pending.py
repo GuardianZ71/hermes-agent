@@ -301,6 +301,17 @@ class TestResumePendingSystemNote:
         )
 
 
+    def test_empty_message_interactive_note_continues_task(self):
+        """Discord/Telegram restart recovery must resume the interrupted
+        request instead of discarding it behind a generic "what next?"."""
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=True
+        )
+        assert "CONTINUE the interrupted task" in note
+        assert "session was restored" not in note
+        assert "ask what they would like to do next" not in note
+        assert "first unfinished step" in note
+
     def test_empty_message_noninteractive_note_continues_task(self):
         """Non-interactive platforms (webhook, API server): nobody can answer
         'what next?', so the resumed turn must complete the interrupted work
