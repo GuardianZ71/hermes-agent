@@ -30,3 +30,11 @@ export function desktopRegistryCronOwnerProfile(profile: unknown): null | string
 export function desktopRegistryBackendRole(profile: unknown): DesktopBackendRole {
   return desktopRegistryCronOwnerProfile(profile) === null ? 'primary' : 'pool'
 }
+
+export function desktopRegistryUsesSharedCronOwner(
+  routeSource: unknown,
+  routeConnectionId: unknown,
+  connectionId: unknown
+): boolean {
+  return routeSource === 'settings' && routeConnectionId === connectionId
+}

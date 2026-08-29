@@ -49,7 +49,8 @@ import {
   desktopBackendEnv,
   desktopBackendRoleForRoute,
   desktopRegistryBackendRole,
-  desktopRegistryCronOwnerProfile
+  desktopRegistryCronOwnerProfile,
+  desktopRegistryUsesSharedCronOwner
 } from './backend-cron-role'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
@@ -10433,6 +10434,34 @@ async function ensureRegistryBackend(connectionId, profile) {
   }
 
   const profileKey = String(profile ?? '').trim() || 'default'
+
+  if (source.kind === 'ssh') {
+    const legacyRoute = resolveDesktopRemoteRoute({
+      config: readDesktopConnectionConfig(),
+      env: {
+        token: process.env.HERMES_DESKTOP_REMOTE_TOKEN,
+        url: process.env.HERMES_DESKTOP_REMOTE_URL
+      },
+      profile: profileKey,
+      registry
+    })
+
+    if (
+      legacyRoute?.kind === 'ssh' &&
+      desktopRegistryUsesSharedCronOwner(legacyRoute.source, legacyRoute.connectionId, id)
+    ) {
+      const connection = await startHermes()
+
+      return {
+        ...connection,
+        profile: profileKey,
+        connectionId: source.id,
+        remoteProfile: legacyRoute.ssh.remoteProfile || '',
+        sharedPrimary: true,
+        sharedRemote: true
+      }
+    }
+  }
 
   if (source.kind === 'local') {
     // The registry's 'local' entry means THIS machine's runtime — always.
