@@ -10450,6 +10450,10 @@ async function ensureRegistryBackend(connectionId, profile) {
       primaryRoute?.kind === 'ssh' &&
       desktopRegistryUsesSharedCronOwner(primaryRoute.connectionId, id)
     ) {
+      // A registry-scoped owner may predate this source becoming the active
+      // primary route. Retire every old scope before reusing startHermes(), or
+      // the immortal default owner and the shared primary both schedule cron.
+      await stopRegistryConnectionBackends(id)
       const connection = await startHermes()
 
       return {
