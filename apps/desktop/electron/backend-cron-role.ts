@@ -31,9 +31,20 @@ export function desktopRegistryBackendRole(profile: unknown): DesktopBackendRole
   return desktopRegistryCronOwnerProfile(profile) === null ? 'primary' : 'pool'
 }
 
+export function desktopRegistryOwnershipProfile(profile: unknown, remoteProfile: unknown): string {
+  // An explicit registry remoteProfile names one concrete remote daemon. Local
+  // profile aliases must therefore share one ownership scope instead of
+  // spawning duplicate serves for that same remote profile.
+  return String(remoteProfile ?? '').trim() ? 'default' : String(profile ?? '').trim() || 'default'
+}
+
 export function desktopRegistryUsesSharedCronOwner(
+  routeSource: unknown,
   routeConnectionId: unknown,
   connectionId: unknown
 ): boolean {
-  return routeConnectionId === connectionId
+  // Only app-wide SSH settings describe the shared primary backend. An
+  // explicit per-profile route remains independently owned even when it points
+  // at the same registry connection.
+  return routeSource === 'settings' && routeConnectionId === connectionId
 }
