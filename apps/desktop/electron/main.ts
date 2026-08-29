@@ -10462,6 +10462,7 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
     if (route.connectionId) {
       managedConnectionUpdateGate.assertCanDial(route.connectionId)
     }
+
     const backendRole = desktopBackendRoleForRoute(profile, primaryProfileKey(), route.source)
 
     connection = await bootstrapSshConnection(
@@ -11129,6 +11130,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
   }
 
   const primaryProfile = primaryProfileKey()
+
   const primaryRoute = resolveDesktopRemoteRoute({
     config: readDesktopConnectionConfig(),
     env: {
@@ -11136,7 +11138,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
       url: process.env.HERMES_DESKTOP_REMOTE_URL
     },
     profile: primaryProfile,
-    registry,
+    registry
   })
 
   if (
@@ -11269,7 +11271,9 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
 
   const ownershipProfile =
     source.kind === 'ssh' ? desktopRegistryOwnershipProfile(profileKey, source.remoteProfile) : profileKey
+
   const cronOwnerProfile = source.kind === 'ssh' ? desktopRegistryCronOwnerProfile(ownershipProfile) : null
+
   const forRequestedProfile = (connection: any) =>
     ownershipProfile === profileKey
       ? connection

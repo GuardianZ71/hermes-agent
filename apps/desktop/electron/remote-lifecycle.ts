@@ -1062,7 +1062,6 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
     `owner=$(IFS= read -r owner < ${marker} && printf '%s' "$owner"); ` +
     `case "$owner" in ''|*[!0-9]*) return 1;; esac; if kill -0 "$owner" 2>/dev/null; then return 1; fi; return 0; }`
 
-
   const dashCmd =
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
     `exec env HERMES_DESKTOP=1 HERMES_DESKTOP_BACKEND_ROLE=${backendRole} ${hermes} ${profileArgs}${subCmd}`
@@ -1265,7 +1264,6 @@ async function spawnRemoteDashboard(
           startedAt: new Date().toISOString()
         }
       })
-
     )
   } catch (error) {
     try {
