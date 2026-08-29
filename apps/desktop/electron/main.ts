@@ -46,7 +46,6 @@ import {
 } from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { BackendDialClaims } from './backend-dial-claim'
 import {
   desktopBackendEnv,
   desktopBackendRoleForRoute,
@@ -56,6 +55,7 @@ import {
   desktopRegistryUsesSharedCronOwner,
   normalizeDesktopBackendRole
 } from './backend-cron-role'
+import { BackendDialClaims } from './backend-dial-claim'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
   isReauthRequiredError,
