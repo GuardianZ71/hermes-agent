@@ -32,9 +32,8 @@ export function desktopRegistryBackendRole(profile: unknown): DesktopBackendRole
 }
 
 export function desktopRegistryUsesSharedCronOwner(
-  routeSource: unknown,
   routeConnectionId: unknown,
   connectionId: unknown
 ): boolean {
-  return routeSource === 'settings' && routeConnectionId === connectionId
+  return routeConnectionId === connectionId
 }

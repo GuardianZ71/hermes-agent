@@ -10436,19 +10436,19 @@ async function ensureRegistryBackend(connectionId, profile) {
   const profileKey = String(profile ?? '').trim() || 'default'
 
   if (source.kind === 'ssh') {
-    const legacyRoute = resolveDesktopRemoteRoute({
+    const primaryRoute = resolveDesktopRemoteRoute({
       config: readDesktopConnectionConfig(),
       env: {
         token: process.env.HERMES_DESKTOP_REMOTE_TOKEN,
         url: process.env.HERMES_DESKTOP_REMOTE_URL
       },
-      profile: profileKey,
+      profile: primaryProfileKey(),
       registry
     })
 
     if (
-      legacyRoute?.kind === 'ssh' &&
-      desktopRegistryUsesSharedCronOwner(legacyRoute.source, legacyRoute.connectionId, id)
+      primaryRoute?.kind === 'ssh' &&
+      desktopRegistryUsesSharedCronOwner(primaryRoute.connectionId, id)
     ) {
       const connection = await startHermes()
 
@@ -10456,7 +10456,7 @@ async function ensureRegistryBackend(connectionId, profile) {
         ...connection,
         profile: profileKey,
         connectionId: source.id,
-        remoteProfile: legacyRoute.ssh.remoteProfile || '',
+        remoteProfile: primaryRoute.ssh.remoteProfile || '',
         sharedPrimary: true,
         sharedRemote: true
       }
