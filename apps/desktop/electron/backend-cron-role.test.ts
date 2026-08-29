@@ -5,6 +5,8 @@ import { test } from 'vitest'
 import {
   desktopBackendEnv,
   desktopBackendRoleForRoute,
+  desktopRegistryBackendRole,
+  desktopRegistryCronOwnerProfile,
   normalizeDesktopBackendRole
 } from './backend-cron-role'
 
@@ -23,4 +25,9 @@ test('Desktop backend cron ownership is explicit and defaults compatibly to prim
   assert.equal(desktopBackendRoleForRoute('other', 'work', 'profile'), 'pool')
   assert.equal(desktopBackendRoleForRoute('other', 'work', 'settings'), 'primary')
   assert.equal(desktopBackendRoleForRoute('other', 'work', 'env'), 'primary')
+
+  assert.equal(desktopRegistryCronOwnerProfile('default'), null)
+  assert.equal(desktopRegistryCronOwnerProfile('work'), 'default')
+  assert.equal(desktopRegistryBackendRole('default'), 'primary')
+  assert.equal(desktopRegistryBackendRole('work'), 'pool')
 })

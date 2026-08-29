@@ -22,3 +22,11 @@ export function desktopBackendRoleForRoute(
   // a pool backend when it does not serve the Desktop's primary profile.
   return routeSource !== 'profile' || profile === primaryProfile ? 'primary' : 'pool'
 }
+
+export function desktopRegistryCronOwnerProfile(profile: unknown): null | string {
+  return String(profile ?? '').trim() === 'default' ? null : 'default'
+}
+
+export function desktopRegistryBackendRole(profile: unknown): DesktopBackendRole {
+  return desktopRegistryCronOwnerProfile(profile) === null ? 'primary' : 'pool'
+}

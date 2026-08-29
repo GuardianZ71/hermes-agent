@@ -45,7 +45,12 @@ import {
 } from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { desktopBackendEnv, desktopBackendRoleForRoute } from './backend-cron-role'
+import {
+  desktopBackendEnv,
+  desktopBackendRoleForRoute,
+  desktopRegistryBackendRole,
+  desktopRegistryCronOwnerProfile
+} from './backend-cron-role'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
   isReauthRequiredError,
@@ -10427,6 +10432,8 @@ async function ensureRegistryBackend(connectionId, profile) {
     throw new Error(`No connection with id "${id}".`)
   }
 
+  const profileKey = String(profile ?? '').trim() || 'default'
+
   if (source.kind === 'local') {
     // The registry's 'local' entry means THIS machine's runtime — always.
     // ensureBackend() follows the v1 routing table, which resolves to a
@@ -10437,8 +10444,6 @@ async function ensureRegistryBackend(connectionId, profile) {
     // the v1 route is genuinely local; otherwise spawn/reuse a forced-local
     // child pooled under the composite 'conn:local::<profile>' key so it
     // can't collide with the v1 remote descriptor cached at the bare key.
-    const profileKey = String(profile ?? '').trim() || 'default'
-
     profileDeletionGate.assertCanStart(profileKey)
 
     const localRoute = resolveRegistryLocalRoute(profileKey, {
@@ -10499,7 +10504,16 @@ async function ensureRegistryBackend(connectionId, profile) {
     return localEntry.connectionPromise
   }
 
-  const key = backendScopeKey(id, profile)
+  const cronOwnerProfile = source.kind === 'ssh' ? desktopRegistryCronOwnerProfile(profileKey) : null
+
+  // Registry SSH backends are profile-scoped, unlike shared remote/cloud
+  // gateways. Keep one dedicated default-profile backend per connection as the
+  // scheduler owner before starting any additional profile pool backend.
+  if (cronOwnerProfile) {
+    await ensureRegistryBackend(id, cronOwnerProfile)
+  }
+
+  const key = backendScopeKey(id, profileKey)
   const existing = backendPool.get(key)
 
   if (existing) {
@@ -10515,6 +10529,7 @@ async function ensureRegistryBackend(connectionId, profile) {
     port: null,
     token: null,
     connectionPromise: null,
+    cronOwner: source.kind === 'ssh' && desktopRegistryBackendRole(profileKey) === 'primary',
     lastActiveAt: Date.now(),
     remoteBaseUrl: null
   }
@@ -10562,7 +10577,7 @@ async function connectRegistryBackend(source, profile, key, poolEntry) {
       sshConfig,
       decryptDesktopSecret(source.token),
       `registry:${source.id}`,
-      'pool'
+      desktopRegistryBackendRole(profileKey)
     )
 
     poolEntry.remoteBaseUrl = connection.baseUrl
@@ -10678,7 +10693,7 @@ function startPoolIdleReaper() {
     const now = Date.now()
 
     for (const [profile, entry] of [...backendPool.entries()]) {
-      if (now - (entry.lastActiveAt || 0) > POOL_IDLE_MS) {
+      if (!entry.cronOwner && now - (entry.lastActiveAt || 0) > POOL_IDLE_MS) {
         rememberLog(`Reaping idle profile backend "${profile}" (idle > ${Math.round(POOL_IDLE_MS / 1000)}s)`)
         stopPoolBackend(profile)
       }
