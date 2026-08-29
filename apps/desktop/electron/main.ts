@@ -45,7 +45,7 @@ import {
 } from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { desktopBackendEnv } from './backend-cron-role'
+import { desktopBackendEnv, desktopBackendRoleForRoute } from './backend-cron-role'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
   isReauthRequiredError,
@@ -9622,18 +9622,18 @@ function effectiveSshConfigFingerprint(sshConfig) {
   return crypto.createHash('sha256').update(output).digest('hex')
 }
 
-async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
+async function bootstrapSshConnection(profile, sshConfig, reuseToken, source, backendRole) {
   const scope = sshScopeKey(profile)
   const effectiveConfigFingerprint = effectiveSshConfigFingerprint(sshConfig)
   const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
   const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
 
   return sshBootstrapCoordinator.start(scope, fingerprint, lease =>
-    bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, fingerprint, lease)
+    bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, fingerprint, lease, backendRole)
   )
 }
 
-async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, source, fingerprint, lease) {
+async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, source, fingerprint, lease, backendRole) {
   const scope = sshScopeKey(profile)
   const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
   const existing = sshConnections.get(scope)
@@ -9681,7 +9681,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     result = await lifecycle({
       ssh,
       profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
-      backendRole: profile === primaryProfileKey() ? 'primary' : 'pool',
+      backendRole,
       remoteHermesPath: sshConfig.remoteHermesPath || '',
       ownershipId: sshOwnershipKey(profile),
       reuseToken: reuseToken || '',
@@ -9832,11 +9832,14 @@ async function resolveRemoteBackend(profile) {
   let connection
 
   if (route.kind === 'ssh') {
+    const backendRole = desktopBackendRoleForRoute(profile, primaryProfileKey(), route.source)
+
     connection = await bootstrapSshConnection(
       route.source === 'profile' ? profile : null,
       route.ssh,
       decryptDesktopSecret(route.token),
-      route.source
+      route.source,
+      backendRole
     )
   } else {
     const token =
@@ -10558,7 +10561,8 @@ async function connectRegistryBackend(source, profile, key, poolEntry) {
       key,
       sshConfig,
       decryptDesktopSecret(source.token),
-      `registry:${source.id}`
+      `registry:${source.id}`,
+      'pool'
     )
 
     poolEntry.remoteBaseUrl = connection.baseUrl
