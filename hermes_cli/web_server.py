@@ -312,6 +312,24 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     provider.start(stop_event, **start_kwargs)
 
 
+def _desktop_backend_owns_cron() -> bool:
+    """Whether this Desktop backend is the long-lived cron owner.
+
+    Desktop keeps one primary backend alive and creates named-profile pool
+    backends on demand.  The primary ticker already multiplexes every
+    profile store, so a pool backend must never start a competing ticker: an
+    orphaned pool process can outlive a code update, win the per-store tick
+    lock, and keep executing recurring jobs from its stale module graph even
+    after the profile gateway and primary backend restart.
+
+    The primary may itself run under a named profile, so ownership comes from
+    the explicit spawn role rather than HERMES_HOME or active profile identity.
+    Missing or unknown roles retain the historical owner behavior for clients
+    that predate the role marker.
+    """
+    return os.getenv("HERMES_DESKTOP_BACKEND_ROLE") != "pool"
+
+
 def _warm_gateway_module() -> None:
     """Pre-import heavy modules so the event loop is not stalled on first use.
 
@@ -445,14 +463,20 @@ async def _lifespan(app: "FastAPI"):
         except Exception:
             _log.exception("Desktop startup: orphan gateway reap failed")
 
-        cron_stop = threading.Event()
-        cron_thread = threading.Thread(
-            target=_start_desktop_cron_ticker,
-            args=(cron_stop,),
-            daemon=True,
-            name="desktop-cron-ticker",
-        )
-        cron_thread.start()
+        if _desktop_backend_owns_cron():
+            cron_stop = threading.Event()
+            cron_thread = threading.Thread(
+                target=_start_desktop_cron_ticker,
+                args=(cron_stop,),
+                daemon=True,
+                name="desktop-cron-ticker",
+            )
+            cron_thread.start()
+        else:
+            _log.info(
+                "Desktop named-profile pool backend defers cron ownership to "
+                "the primary backend"
+            )
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))

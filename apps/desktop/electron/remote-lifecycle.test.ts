@@ -49,6 +49,7 @@ function ownedLock(over: any = {}) {
     pid: 333,
     port: 40000,
     profile: '',
+    backendRole: 'primary',
     hermesPath: '~/.local/bin/hermes',
     hermesHome: '~/.hermes',
     logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
@@ -516,6 +517,21 @@ test('buildSpawnCommand always uses serve (legacy dashboard path removed)', () =
   assert.match(cmd, /setsid/)
 })
 
+test('buildSpawnCommand marks primary and pool cron ownership explicitly', () => {
+  const primary = buildSpawnCommand('/x/hermes', 'work', {
+    backendRole: 'primary',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
+  })
+
+  const pool = buildSpawnCommand('/x/hermes', 'work', {
+    backendRole: 'pool',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
+  })
+
+  assert.match(primary, /HERMES_DESKTOP_BACKEND_ROLE=primary/)
+  assert.match(pool, /HERMES_DESKTOP_BACKEND_ROLE=pool/)
+})
+
 test('spawnRemoteDashboard returns exact ownership artifacts', async () => {
   const ssh = fakeSsh([
     [/grep -q ssh-session-token-file/, 'YES\n'],
@@ -740,6 +756,33 @@ test('connect() respawns when the requested remote profile differs from the lock
     ssh.calls.some(c => /setsid/.test(c)),
     'profile mismatch must spawn a fresh dashboard'
   )
+})
+
+test('connect() respawns an opposite-role backend instead of reusing its module graph', async () => {
+  const reuseToken = 'stored-token'
+  const lock = ownedLock({ backendRole: 'pool', tokenFingerprint: fingerprintToken(reuseToken) })
+
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/kill 333/, ''],
+    [/--version/, 'Hermes Agent v0.18.2\n'],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid/, '890\n'],
+    [/kill -0 890/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=52051\n']
+  ])
+
+  const result = await connect(
+    connectDeps(ssh, { backendRole: 'primary', reuseToken, adoptServedToken: async () => 'fresh' })
+  )
+
+  assert.equal(result.reused, false)
+  assert.ok(ssh.calls.some(c => /HERMES_DESKTOP_BACKEND_ROLE=primary/.test(c)))
 })
 
 test('connect() respawns when the lockfile hermesPath differs from the resolved path', async () => {

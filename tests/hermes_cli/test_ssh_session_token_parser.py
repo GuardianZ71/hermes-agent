@@ -147,3 +147,17 @@ def test_windows_runtime_root_stays_at_machine_root_for_named_profile(tmp_path, 
     monkeypatch.setenv("HERMES_HOME", str(machine_root / "profiles" / "writer_2"))
 
     assert windows_ssh_runtime._root() == machine_root / "desktop-ssh"
+
+
+def test_windows_runtime_rejects_unknown_desktop_backend_role():
+    from hermes_cli import windows_ssh_runtime
+
+    with pytest.raises(ValueError, match="invalid desktop backend role"):
+        windows_ssh_runtime.spawn_backend(
+            {
+                "ownershipId": "a" * 32,
+                "spawnNonce": "b" * 16,
+                "hermesPath": "/x/hermes.exe",
+                "backendRole": "other",
+            }
+        )

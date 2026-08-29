@@ -45,6 +45,7 @@ import {
 } from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
+import { desktopBackendEnv } from './backend-cron-role'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
   isReauthRequiredError,
@@ -9680,6 +9681,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     result = await lifecycle({
       ssh,
       profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
+      backendRole: profile === primaryProfileKey() ? 'primary' : 'pool',
       remoteHermesPath: sshConfig.remoteHermesPath || '',
       ownershipId: sshOwnershipKey(profile),
       reuseToken: reuseToken || '',
@@ -10790,9 +10792,9 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
         // can still point at the install dir even when spawn cwd is home.
         TERMINAL_CWD: hermesCwd,
         HERMES_DASHBOARD_SESSION_TOKEN: token,
-        // Marks this dashboard backend as desktop-spawned so it runs the cron
-        // scheduler tick loop (the gateway isn't running under the app).
-        HERMES_DESKTOP: '1',
+        // Pool backends are transient profile views. The long-lived primary
+        // backend multiplexes every profile's cron store.
+        ...desktopBackendEnv('pool'),
         // Exact parent identity lets the backend self-exit after an unclean
         // Desktop death without mistaking a reused PID for its owner. If the
         // optional marker probe fails, retain legacy PID-only tracking.
@@ -11179,9 +11181,9 @@ async function startHermes() {
           ...backend.env,
           TERMINAL_CWD: hermesCwd,
           HERMES_DASHBOARD_SESSION_TOKEN: token,
-          // Marks this dashboard backend as desktop-spawned so it runs the cron
-          // scheduler tick loop (the gateway isn't running under the app).
-          HERMES_DESKTOP: '1',
+          // The primary may itself run under a named profile. Cron ownership is
+          // a process role, never inferred from that profile identity.
+          ...desktopBackendEnv('primary'),
           // Exact parent identity lets the backend self-exit after an unclean
           // Desktop death without mistaking a reused PID for its owner. If the
           // optional marker probe fails, retain legacy PID-only tracking.

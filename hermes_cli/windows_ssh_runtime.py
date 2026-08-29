@@ -397,6 +397,9 @@ def spawn_backend(payload: dict[str, Any]) -> dict[str, Any]:
     profile = str(payload.get("profile") or "")
     if len(profile) > 256 or any(ch in profile for ch in "\x00\r\n"):
         raise ValueError("invalid profile")
+    backend_role = str(payload.get("backendRole") or "primary")
+    if backend_role not in ("primary", "pool"):
+        raise ValueError("invalid desktop backend role")
     venv_dir = os.path.dirname(hermes_path)
     python_entry = os.path.join(venv_dir, "python.exe")
     if not os.path.isfile(python_entry):
@@ -419,6 +422,8 @@ def spawn_backend(payload: dict[str, Any]) -> dict[str, Any]:
     # VIRTUAL_ENV preserves venv identity; PYTHONPATH is deliberately NOT set (see above).
     env = dict(os.environ)
     env["VIRTUAL_ENV"] = os.path.dirname(venv_dir)
+    env["HERMES_DESKTOP"] = "1"
+    env["HERMES_DESKTOP_BACKEND_ROLE"] = backend_role
     env.pop("PYTHONPATH", None)
     _ensure_scope(ownership_id)
     creationflags = 0x00000008 | 0x00000200 | 0x01000000

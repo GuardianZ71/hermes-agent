@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 
+import { normalizeDesktopBackendRole } from './backend-cron-role'
 import { assertBootstrapNotSuperseded, redactSecrets, SSH_ERROR } from './ssh-connection'
 
 const LOCKFILE_SCHEMA_VERSION = 2
@@ -149,7 +150,7 @@ function validLock(lock, ownershipId) {
   )
 }
 
-function reusableWindowsLock(lock, state, profile, reuseToken, runtime) {
+function reusableWindowsLock(lock, state, profile, reuseToken, runtime, backendRole = 'primary') {
   return Boolean(
     state.alive &&
     state.owned &&
@@ -158,7 +159,8 @@ function reusableWindowsLock(lock, state, profile, reuseToken, runtime) {
     reuseToken &&
     lock.tokenFingerprint === fingerprintToken(reuseToken) &&
     lock.hermesPath === runtime.hermesPath &&
-    lock.hermesHome === runtime.hermesHome
+    lock.hermesHome === runtime.hermesHome &&
+    lock.backendRole === normalizeDesktopBackendRole(backendRole)
   )
 }
 
@@ -266,6 +268,7 @@ async function connectWindowsRemote(deps) {
     ssh,
     ownershipId,
     profile = '',
+    backendRole: requestedBackendRole = 'primary',
     remoteHermesPath = '',
     reuseToken = '',
     signal,
@@ -277,6 +280,8 @@ async function connectWindowsRemote(deps) {
     rememberLog = () => {},
     readyTimeoutMs = 45_000
   } = deps
+
+  const backendRole = normalizeDesktopBackendRole(requestedBackendRole)
 
   assertBootstrapNotSuperseded(signal)
   const runtime = await probeWindowsRemote(ssh, remoteHermesPath)
@@ -304,7 +309,7 @@ async function connectWindowsRemote(deps) {
       throw error
     }
 
-    const reusable = reusableWindowsLock(lock, state, profile, reuseToken, runtime)
+    const reusable = reusableWindowsLock(lock, state, profile, reuseToken, runtime, backendRole)
 
     if (reusable) {
       const localPort = await pickLocalPort()
@@ -360,7 +365,7 @@ async function connectWindowsRemote(deps) {
       runtime,
       'spawn',
       [],
-      JSON.stringify({ ownershipId, spawnNonce, profile, hermesPath: runtime.hermesPath })
+      JSON.stringify({ ownershipId, spawnNonce, profile, backendRole, hermesPath: runtime.hermesPath })
     )
   } catch (error) {
     await helper(ssh, runtime, 'remove-token', [ownershipId, spawnNonce])
@@ -376,6 +381,7 @@ async function connectWindowsRemote(deps) {
     creationTimeNs: spawned.creationTimeNs,
     port: 0,
     profile,
+    backendRole,
     hermesPath: runtime.hermesPath,
     hermesHome: runtime.hermesHome,
     tokenFingerprint: fingerprintToken(token),

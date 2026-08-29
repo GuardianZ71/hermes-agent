@@ -128,6 +128,7 @@ test('Windows SSH reuse requires the requested remote profile to match the lock'
     creationTimeNs: '1784219690452757504',
     port: 1234,
     profile: 'default',
+    backendRole: 'primary',
     tokenFingerprint: crypto.createHash('sha256').update(token).digest('hex').slice(0, 32),
     hermesPath: 'C:\\h\\hermes.exe',
     hermesHome: 'C:\\h'
@@ -139,6 +140,8 @@ test('Windows SSH reuse requires the requested remote profile to match the lock'
   assert.equal(reusableWindowsLock(lock, state, 'default', token, runtime), true)
   assert.equal(reusableWindowsLock(lock, state, 'desktop-work', token, runtime), false)
   assert.equal(reusableWindowsLock({ ...lock, profile: '' }, state, '', token, runtime), true)
+  assert.equal(reusableWindowsLock(lock, state, 'default', token, runtime, 'pool'), false)
+  assert.equal(reusableWindowsLock({ ...lock, backendRole: undefined }, state, 'default', token, runtime), false)
 })
 
 test('Windows integrated terminal uses encoded PowerShell and preserves cwd as literal data', () => {

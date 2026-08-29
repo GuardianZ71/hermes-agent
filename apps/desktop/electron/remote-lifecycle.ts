@@ -27,6 +27,7 @@
 
 import crypto from 'node:crypto'
 
+import { normalizeDesktopBackendRole } from './backend-cron-role'
 import { parseRemoteProfileListing } from './connection-registry'
 import { assertBootstrapNotSuperseded } from './ssh-connection'
 
@@ -529,10 +530,11 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const tokenArg = tokenFilePath ? ` --ssh-session-token-file ${expandRemotePath(tokenFilePath)}` : ''
   const ownerArg = opts.spawnNonce ? ` --ssh-owner-nonce ${validateSpawnNonce(opts.spawnNonce)}` : ''
   const subCmd = `serve --isolated --host 127.0.0.1 --port 0${tokenArg}${ownerArg}`
+  const backendRole = normalizeDesktopBackendRole(opts.backendRole)
 
   const dashCmd =
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
-    `exec env HERMES_DESKTOP=1 ${hermes} ${profileArgs}${subCmd}`
+    `exec env HERMES_DESKTOP=1 HERMES_DESKTOP_BACKEND_ROLE=${backendRole} ${hermes} ${profileArgs}${subCmd}`
 
   return (
     `mkdir -p "$(dirname ${logPath})" && ` +
@@ -589,7 +591,7 @@ async function scrapeReadyPort(ssh, logPath, { timeoutMs = DEFAULT_READY_TIMEOUT
   throw err
 }
 
-async function spawnRemoteDashboard(ssh, { hermesPath, profile, token, ownershipId }) {
+async function spawnRemoteDashboard(ssh, { hermesPath, profile, token, ownershipId, backendRole = 'primary' }) {
   if (!(await remoteSupportsSshOwnership(ssh, hermesPath))) {
     const err: any = new Error(
       'The remote Hermes install does not support --ssh-session-token-file and --ssh-owner-nonce. ' +
@@ -649,7 +651,9 @@ async function spawnRemoteDashboard(ssh, { hermesPath, profile, token, ownership
   let out
 
   try {
-    out = await ssh.exec(buildSpawnCommand(hermesPath, profile, { spawnNonce, tokenFilePath, logPath }))
+    out = await ssh.exec(
+      buildSpawnCommand(hermesPath, profile, { backendRole, spawnNonce, tokenFilePath, logPath })
+    )
   } catch (error) {
     try {
       await ssh.exec(`rm -f ${expandRemotePath(tokenFilePath)}`)
@@ -748,6 +752,7 @@ async function connect(deps) {
   const {
     ssh,
     profile = '',
+    backendRole: requestedBackendRole = 'primary',
     remoteHermesPath = '',
     ownershipId,
     forward,
@@ -759,6 +764,8 @@ async function connect(deps) {
     readyTimeoutMs = DEFAULT_READY_TIMEOUT_MS,
     signal
   } = deps
+
+  const backendRole = normalizeDesktopBackendRole(requestedBackendRole)
 
   const log = msg => rememberLog(`[ssh-lifecycle] ${msg}`)
 
@@ -800,7 +807,8 @@ async function connect(deps) {
       Boolean(reuseToken) &&
       lock.tokenFingerprint === fingerprintToken(reuseToken) &&
       lock.hermesPath === hermesPath &&
-      lock.hermesHome === hermesHome
+      lock.hermesHome === hermesHome &&
+      lock.backendRole === backendRole
 
     if (reusable) {
       assertBootstrapNotSuperseded(signal)
@@ -873,7 +881,8 @@ async function connect(deps) {
     hermesPath,
     profile,
     token: spawnToken,
-    ownershipId
+    ownershipId,
+    backendRole
   })
 
   log(`spawned remote dashboard pid=${pid}`)
@@ -884,6 +893,7 @@ async function connect(deps) {
     pid,
     port: 0,
     profile,
+    backendRole,
     hermesPath,
     hermesHome,
     logPath,

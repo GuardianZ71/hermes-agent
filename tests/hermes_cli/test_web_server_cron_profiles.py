@@ -36,6 +36,60 @@ def _drain_queue(q):
             return values
 
 
+def test_desktop_cron_owner_uses_process_role_not_profile_identity(monkeypatch):
+    from hermes_cli import web_server
+
+    for role, expected in (
+        (None, True),
+        ("primary", True),
+        ("pool", False),
+        ("unexpected", True),
+    ):
+        if role is None:
+            monkeypatch.delenv("HERMES_DESKTOP_BACKEND_ROLE", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_DESKTOP_BACKEND_ROLE", role)
+        assert web_server._desktop_backend_owns_cron() is expected
+
+
+def test_desktop_named_profile_pool_defers_recurring_cron_to_refreshed_primary(
+    monkeypatch, _isolate_hermes_home
+):
+    """A stale named-profile pool cannot keep winning ticks after restart.
+
+    The long-lived primary backend multiplexes every profile store. Simulate a
+    named pool lifespan followed by a refreshed primary lifespan and prove only
+    the refreshed owner starts the recurring ticker.
+    """
+    from starlette.testclient import TestClient
+
+    import hermes_cli.gateway as gateway
+    from hermes_cli import web_server
+
+    starts = []
+    ownership = iter((False, True))
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setattr(web_server, "_warm_gateway_module", lambda: None)
+    monkeypatch.setattr(gateway, "_reap_unsupervised_gateway_orphans", lambda: False)
+    monkeypatch.setattr(
+        web_server, "_desktop_backend_owns_cron", lambda: next(ownership)
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_start_desktop_cron_ticker",
+        lambda _stop: starts.append("refreshed-primary"),
+    )
+
+    with TestClient(web_server.app):
+        pass
+    assert starts == []
+
+    with TestClient(web_server.app):
+        pass
+    assert starts == ["refreshed-primary"]
+
+
 
 
 def test_fire_cron_job_scopes_store_and_runtime_home_together(
