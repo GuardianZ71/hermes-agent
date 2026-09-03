@@ -160,6 +160,52 @@ class TestSweep:
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
 
+    def test_identical_replies_from_concurrent_turns_recover_once(self):
+        """Distinct inbound IDs can create two obligations for one reply."""
+        _record(oid="ob-1", content="same final reply")
+        _record(oid="ob-2", content="same final reply")
+        now = time.time()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
+                (now - 60, "ob-1"),
+            )
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
+                (now - 10, "ob-2"),
+            )
+        _orphan("ob-1")
+        _orphan("ob-2")
+
+        claimed = dl.sweep_recoverable(now=now)
+
+        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
+        duplicate = _row("ob-2")
+        assert duplicate is not None
+        assert duplicate["state"] == "abandoned"
+        assert duplicate["attempts"] == 0
+        assert duplicate["last_error"] == "duplicate_recovery_content"
+
+    def test_identical_replies_outside_burst_window_remain_distinct(self):
+        _record(oid="ob-1", content="same final reply")
+        _record(oid="ob-2", content="same final reply")
+        now = time.time()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
+                (now - dl.RECOVERY_DUPLICATE_WINDOW_SECONDS - 10, "ob-1"),
+            )
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
+                (now, "ob-2"),
+            )
+        _orphan("ob-1")
+        _orphan("ob-2")
+
+        claimed = dl.sweep_recoverable(now=now)
+
+        assert [row["obligation_id"] for row in claimed] == ["ob-1", "ob-2"]
+
 
 class TestRuntimeFailedSweep:
     """A live gateway may reclaim only its own transient reconnect failures."""

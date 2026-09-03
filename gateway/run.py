@@ -34422,41 +34422,37 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
 
-    # Multiplex profiles: tell the built-in ticker which profile homes to
-    # tick so secondary-profile cron jobs actually fire (#69377).
-    # Without this, only the process-global HERMES_HOME (default profile)
-    # is iterated and every secondary profile's cron store is silently
-    # ignored — jobs show as "scheduled" with a valid next_run_at but
-    # never execute because no ticker owns that store.
-    if (
-        isinstance(cron_provider, InProcessCronScheduler)
-        and multiplex_cron
-    ):
+    # Pin every built-in ticker to explicit profile homes. In multiplex mode
+    # this is the served roster (#69377). In single-profile mode an explicit
+    # one-entry roster prevents a temporary process-wide HERMES_HOME change
+    # from making this ticker claim another profile's due job.
+    if isinstance(cron_provider, InProcessCronScheduler):
         try:
-            profile_homes = _multiplex_profile_homes(runner.config)
+            if multiplex_cron:
+                profile_homes = _multiplex_profile_homes(runner.config)
+            else:
+                from hermes_cli.profiles import get_active_profile_name
+                from hermes_constants import get_hermes_home as _get_hermes_home_for_cron
+
+                active_profile = get_active_profile_name() or "default"
+                profile_homes = [(active_profile, _get_hermes_home_for_cron().resolve())]
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
-                # Per-profile adapters so each profile's cron output is
-                # delivered via its own bot/adapter instead of the default
-                # profile's.
-                cron_start_kwargs["profile_adapters"] = getattr(
-                    runner, "_profile_adapters", None
-                )
-                # runner.adapters belongs to the default profile, which
-                # profiles_to_serve() names "default" in its multiplex list.
-                # Thread that identity so the ticker reserves the shared adapters
-                # for the default profile alone and never routes a secondary's
-                # cron through the default bot (even before its adapter connects,
-                # when profile_adapters[name] is still absent/empty).
-                cron_start_kwargs["default_profile"] = "default"
+                if multiplex_cron:
+                    # Per-profile adapters keep each profile's cron output on
+                    # its own bot/adapter instead of the default profile's.
+                    cron_start_kwargs["profile_adapters"] = getattr(
+                        runner, "_profile_adapters", None
+                    )
+                    cron_start_kwargs["default_profile"] = "default"
                 logger.info(
-                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
+                    "Cron scheduler pinned to %d profile store(s): %s",
                     len(profile_homes),
                     [p[0] if isinstance(p, tuple) else p for p in profile_homes],
                 )
         except Exception as exc:
             logger.warning(
-                "Could not resolve profile homes for multiplex cron: %s",
+                "Could not pin cron profile homes: %s",
                 exc,
             )
 

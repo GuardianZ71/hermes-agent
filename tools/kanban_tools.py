@@ -264,7 +264,7 @@ def _goal_mode_handoff_rejection(task, evidence: str):
     verdict = "done"
     reason = ""
     try:
-        verdict, reason, _, _, _ = judge_goal(
+        verdict, reason, _, _, transport_failed = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
         )
@@ -276,6 +276,13 @@ def _goal_mode_handoff_rejection(task, evidence: str):
             judge_exc,
             exc_info=True,
         )
+        return ("done", None)
+    if transport_failed:
+        logger.warning(
+            "goal judge transport failed, allowing lifecycle handoff: %s",
+            reason,
+        )
+        return ("done", None)
     return (verdict, None if verdict == "done" else reason)
 
 

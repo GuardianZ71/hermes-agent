@@ -62,6 +62,10 @@ _DB_LOCK = threading.Lock()
 # only matter in the rare recovery path).
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
+# Collapse byte-identical replies produced for the same route within one short
+# burst. Concurrent follow-up/resume paths can carry different triggering
+# message IDs while still producing the same final text.
+RECOVERY_DUPLICATE_WINDOW_SECONDS = 5 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
 
@@ -341,8 +345,10 @@ def sweep_recoverable(
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed')
+               ORDER BY created_at ASC"""
         ).fetchall()
+        recoverable_content_seen: Dict[tuple, float] = {}
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at,
              adapter_profile) in rows:
@@ -367,6 +373,31 @@ def sweep_recoverable(
                 and (platform, adapter_profile) not in deliverable_targets
             ):
                 continue
+            duplicate_key = (
+                session_key,
+                platform,
+                chat_id,
+                thread_id,
+                content,
+                adapter_profile,
+            )
+            prior_created_at = recoverable_content_seen.get(duplicate_key)
+            if (
+                prior_created_at is not None
+                and created_at - prior_created_at
+                <= RECOVERY_DUPLICATE_WINDOW_SECONDS
+            ):
+                # Advance the burst edge so a stream of near-concurrent
+                # duplicates cannot leak one copy every window interval.
+                recoverable_content_seen[duplicate_key] = created_at
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?, last_error=?
+                       WHERE obligation_id=?""",
+                    (now, "duplicate_recovery_content", oid),
+                )
+                continue
+            recoverable_content_seen[duplicate_key] = created_at
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,

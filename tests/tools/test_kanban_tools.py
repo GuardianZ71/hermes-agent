@@ -215,6 +215,55 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
+def test_complete_goal_mode_transport_failure_fails_open(monkeypatch, tmp_path):
+    """A transiently broken judge must not wedge a verified completion."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        goal_task_id = kb.create_task(
+            conn,
+            title="goal-mode-transport-test",
+            assignee="test-worker",
+            body="Must achieve X with verified evidence.",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, goal_task_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda *args, **kwargs: (
+            "continue", "judge error: APIError", False, None, True,
+        ),
+    )
+
+    completed = json.loads(kt._handle_complete({"summary": "Verified X."}))
+    assert completed.get("ok") is True
+
+    conn2 = kb.connect()
+    try:
+        task = kb.get_task(conn2, goal_task_id)
+        assert task is not None
+        assert task.status == "done"
+    finally:
+        conn2.close()
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})
