@@ -1789,12 +1789,20 @@ def strip_cloned_single_use_oauth_grants(profile_dir: Path) -> Dict[str, Any]:
         from hermes_constants import get_default_hermes_root
 
         root_auth_path = get_default_hermes_root() / "auth.json"
-        if _is_same_auth_store(auth_path, root_auth_path):
+        if _same_path(auth_path, root_auth_path):
             return stripped
+        try:
+            root_auth_path.stat()
+        except FileNotFoundError:
+            # A missing root store cannot be the existing profile file.
+            pass
+        else:
+            if auth_path.samefile(root_auth_path):
+                return stripped
     except Exception:
-        # Profile creation must remain best-effort credential hygiene. If the
-        # root cannot be resolved, continue with the existing copy-strip path.
-        pass
+        # Fail closed: an unresolved root or transient stat failure must not
+        # turn an aliased shared store into a credential-deletion target.
+        return stripped
     try:
         store = json.loads(auth_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
