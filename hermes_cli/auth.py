@@ -1468,7 +1468,12 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
+def _save_auth_store(
+    auth_store: Dict[str, Any],
+    target_path: Optional[Path] = None,
+    *,
+    preserve_symlinks: bool = True,
+) -> Path:
     # target_path=None preserves the existing contract (write the active
     # store at _auth_file_path()). An explicit path lets callers persist a
     # specific store — e.g. the global-root write-through for rotating xAI
@@ -1499,7 +1504,12 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        atomic_replace(tmp_path, auth_file)
+        if preserve_symlinks:
+            atomic_replace(tmp_path, auth_file)
+        else:
+            # Clone cleanup must replace the profile entry itself. Following a
+            # symlink introduced after its identity check could erase root auth.
+            os.replace(tmp_path, auth_file)
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
         except OSError:
@@ -1843,7 +1853,7 @@ def strip_cloned_single_use_oauth_grants(profile_dir: Path) -> Dict[str, Any]:
     if not changed:
         return stripped
     try:
-        _save_auth_store(store, target_path=auth_path)
+        _save_auth_store(store, target_path=auth_path, preserve_symlinks=False)
     except Exception:
         logger.debug(
             "Failed to strip cloned single-use OAuth grants from %s",
