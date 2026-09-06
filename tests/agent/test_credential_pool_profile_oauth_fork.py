@@ -160,6 +160,31 @@ def test_strip_helper_is_a_noop_without_credentials(tmp_path):
     assert strip_cloned_single_use_oauth_grants(tmp_path) == {"pool": [], "providers": [], "files": []}
 
 
+@pytest.mark.parametrize(
+    "link",
+    [
+        lambda target, alias: alias.symlink_to(target),
+        lambda target, alias: os.link(target, alias),
+    ],
+    ids=["symlink", "hardlink"],
+)
+def test_strip_helper_leaves_shared_root_auth_store_unchanged(fleet, link):
+    """A shared auth store is one grant, not a cloned credential copy."""
+    from hermes_cli.auth import strip_cloned_single_use_oauth_grants
+
+    root = fleet["root"]
+    _seed_codex_grant(root)
+    before = (root / "auth.json").read_text()
+    shared = _shared_profile(fleet, "shared", link=link)
+
+    assert strip_cloned_single_use_oauth_grants(shared) == {
+        "pool": [],
+        "providers": [],
+        "files": [],
+    }
+    assert (root / "auth.json").read_text() == before
+
+
 # ── B. borrowed rotation commits to root, never a profile copy ───────────
 
 def test_first_profile_rotation_does_not_strand_root_or_siblings(fleet):
