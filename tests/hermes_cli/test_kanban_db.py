@@ -953,6 +953,50 @@ def test_respawn_guard_requeue_before_pr_does_not_bypass(kanban_home):
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
 
 
+def test_respawn_guard_active_pr_continuation_is_consumed_by_claim(kanban_home):
+    """An explicit continuation authorizes exactly one subsequent claim."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="one-shot", assignee="alice", initial_status="blocked"
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/44", now - 60),
+        )
+        promoted, reason = kb.promote_task(
+            conn, task_id, actor="test", reason="continue existing PR"
+        )
+        assert promoted, reason
+        assert kb.check_respawn_guard(conn, task_id) is None
+        assert kb.claim_task(conn, task_id) is not None
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL, current_run_id=NULL WHERE id=?",
+            (task_id,),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_generic_status_after_pr_does_not_authorize(kanban_home):
+    """A generic status event cannot permanently disable PR protection."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="status-only", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/45", now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'status', ?)",
+            (task_id, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------
