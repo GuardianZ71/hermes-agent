@@ -29,6 +29,24 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_dispatch_control_plane_flags_parse():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args([
+        "kanban", "dispatch",
+        "--exclude-task", "t_one",
+        "--exclude-task", "t_two",
+        "--max-in-progress", "5",
+        "--max-in-progress-per-profile", "2",
+    ])
+
+    assert args.exclude_task == ["t_one", "t_two"]
+    assert args.max_in_progress == 5
+    assert args.max_in_progress_per_profile == 2
+
+
 
 
 

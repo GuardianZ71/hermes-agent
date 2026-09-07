@@ -98,3 +98,71 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert res2.spawned[0][0] != spawned_id  # different task this time
 
 
+def test_per_profile_cap_counts_running_tasks_on_other_boards(
+    isolated_kanban_home_with_profiles,
+):
+    """Two boards must share one profile occupancy budget."""
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Primary")
+    kb.create_board(slug="second", name="Second")
+
+    with kb.connect_closing(board="second") as conn:
+        for i in range(2):
+            task_id = kb.create_task(conn, title=f"busy-{i}", assignee="alpha")
+            assert kb.claim_task(conn, task_id) is not None
+
+    with kb.connect_closing(board="default") as conn:
+        waiting = kb.create_task(conn, title="waiting", assignee="alpha")
+        other = kb.create_task(conn, title="other-profile", assignee="beta")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress_per_profile=2,
+            board="default",
+        )
+
+    assert [item[0] for item in result.spawned] == [other]
+    assert (waiting, "alpha", 2) in result.skipped_per_profile_capped
+
+
+def test_per_profile_other_board_count_fails_closed(
+    isolated_kanban_home_with_profiles, monkeypatch,
+):
+    kb = isolated_kanban_home_with_profiles
+    monkeypatch.setattr(
+        kb,
+        "list_boards",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert kb.count_running_tasks_by_profile_other_boards() is None
+
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="must-wait", assignee="alpha")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress_per_profile=2,
+        )
+    assert result.spawned == []
+
+
+def test_dispatch_exclusion_skips_only_named_candidate(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Test")
+    with kb.connect_closing() as conn:
+        excluded = kb.create_task(conn, title="same-domain", assignee="alpha", priority=10)
+        allowed = kb.create_task(conn, title="unrelated", assignee="beta", priority=1)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            excluded_task_ids=[excluded],
+        )
+    assert result.skipped_excluded == [excluded]
+    assert [item[0] for item in result.spawned] == [allowed]
+
+

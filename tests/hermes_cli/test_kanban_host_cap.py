@@ -175,15 +175,24 @@ def test_max_in_progress_partial_budget_across_boards(
     assert len(res.spawned) == 1
 
 
-def test_count_running_tasks_other_boards_fails_open(
+def test_count_running_tasks_other_boards_fails_closed(
     kanban_home, monkeypatch,
 ):
-    """A broken board enumeration must not brick dispatch (returns 0)."""
+    """Unknown fleet occupancy must close host-level admission."""
     monkeypatch.setattr(
         kb, "list_boards",
         lambda **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert kb.count_running_tasks_other_boards() == 0
+    assert kb.count_running_tasks_other_boards() is None
+
+    spawns: list = []
+    with kb.connect() as conn:
+        kb.create_task(conn, title="must-wait", assignee="alice")
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=5,
+        )
+    assert spawns == []
+    assert res.spawned == []
 
 
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):

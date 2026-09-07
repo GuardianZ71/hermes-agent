@@ -8060,6 +8060,8 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_excluded: list[str] = field(default_factory=list)
+    """Ready tasks omitted by an explicit dispatch-time exclusion filter."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9449,8 +9451,9 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds). A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
-        A later explicit requeue bypasses this guard because dependency
-        promotion or operator action deliberately resumed the existing task.
+        A later explicit continuation event bypasses this guard once. The
+        next claim consumes that authorization, so an old requeue cannot
+        disable duplicate protection for the rest of the PR window.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9540,9 +9543,9 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    A later explicit requeue is deliberate continuation after review or
-    #    operator action, so it must resume the existing task instead of being
-    #    trapped by the stale PR comment for the full guard window.
+    #    Only a later explicit continuation/review/reclaim event authorizes one
+    #    more claim. Generic status/dependency events are not evidence of that
+    #    intent, and an authorization older than the latest claim is consumed.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     latest_pr_comment_at: Optional[int] = None
     for c in conn.execute(
@@ -9554,15 +9557,21 @@ def check_respawn_guard(
             latest_pr_comment_at = int(c["created_at"] or 0)
             break
     if latest_pr_comment_at is not None:
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('status', 'promoted', 'promoted_manual', "
-            "'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, latest_pr_comment_at),
+        latest_claim = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
         ).fetchone()
-        if not requeued_after:
+        latest_claim_id = int(latest_claim["id"]) if latest_claim else 0
+        continuation = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at > ? AND id > ? "
+            "AND kind IN ('promoted_manual', 'unblocked', 'reclaimed', "
+            "'changes_requested', 'review_reopened') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, latest_pr_comment_at, latest_claim_id),
+        ).fetchone()
+        if not continuation:
             return "active_pr"
 
     return None
@@ -9769,7 +9778,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
-def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+def count_running_tasks_other_boards(board: Optional[str] = None) -> Optional[int]:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
     The concurrency caps bound the HOST (workers are OS processes sharing
@@ -9780,8 +9789,8 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
 
     Boards are matched by resolved DB path, so the ``HERMES_KANBAN_DB``
     override (which pins every board to one file) naturally yields 0.
-    Fails open per board: one broken/corrupt board must not brick dispatch
-    on the healthy ones.
+    This is an admission boundary, so it fails closed with ``None`` whenever
+    board discovery or any active board cannot be read.
     """
     try:
         current_path = str(kanban_db_path(board=board).expanduser().resolve())
@@ -9790,7 +9799,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     try:
         boards = list_boards(include_archived=False)
     except Exception:
-        return 0
+        return None
     total = 0
     for meta in boards:
         slug = meta.get("slug") or DEFAULT_BOARD
@@ -9800,18 +9809,67 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
             if current_path is not None and resolved == current_path:
                 continue
             if not path.exists():
-                continue
+                return None
             other = connect(board=slug)
             try:
-                total += count_running_tasks(other)
+                total += int(
+                    other.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                    ).fetchone()[0]
+                )
             finally:
                 try:
                     other.close()
                 except Exception:
                     pass
         except Exception:
-            continue
+            return None
     return total
+
+
+def count_running_tasks_by_profile_other_boards(
+    board: Optional[str] = None,
+) -> Optional[dict[str, int]]:
+    """Return active-task counts per assignee across every other board.
+
+    ``max_in_progress_per_profile`` is a fleet occupancy limit, just like the
+    host-wide ``max_in_progress`` limit above. Counting only the current board
+    lets two board dispatchers each admit the same profile up to the configured
+    cap. This admission boundary fails closed: when any board is unreadable,
+    fleet occupancy is unknown and the caller must admit no new worker.
+    """
+    try:
+        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return None
+    counts: dict[str, int] = {}
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        try:
+            path = kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                return None
+            other = connect(board=slug)
+            try:
+                for row in other.execute(
+                    "SELECT assignee, COUNT(*) AS n FROM tasks "
+                    "WHERE status = 'running' AND assignee IS NOT NULL "
+                    "GROUP BY assignee"
+                ):
+                    profile = str(row["assignee"])
+                    counts[profile] = counts.get(profile, 0) + int(row["n"])
+            finally:
+                other.close()
+        except Exception:
+            return None
+    return counts
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -9849,6 +9907,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    excluded_task_ids: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -9884,6 +9943,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            excluded_task_ids=excluded_task_ids,
             reconcile_orphans=reconcile_orphans,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -9904,6 +9964,7 @@ def dispatch_once(
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+                excluded_task_ids=excluded_task_ids,
                 reconcile_orphans=reconcile_orphans,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
@@ -9931,6 +9992,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    excluded_task_ids: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -10033,7 +10095,14 @@ def _dispatch_once_locked(
     # this, N active boards multiply the cap by N — exactly the fan-out
     # the memory-derived default exists to prevent.
     if max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
+        other_running = count_running_tasks_other_boards(board)
+        if other_running is None:
+            _log.error(
+                "kanban dispatch: fleet host occupancy is unreadable; "
+                "admitting no new workers this tick"
+            )
+            return result
+        total_running = running_count + other_running
         if total_running >= max_in_progress:
             return result
         remaining = max_in_progress - total_running
@@ -10106,6 +10175,7 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
         ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
+    _excluded_task_ids = frozenset(excluded_task_ids or ())
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -10120,12 +10190,23 @@ def _dispatch_once_locked(
     ) else None
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
+        other_profile_counts = count_running_tasks_by_profile_other_boards(board)
+        if other_profile_counts is None:
+            _log.error(
+                "kanban dispatch: fleet per-profile occupancy is unreadable; "
+                "admitting no new workers this tick"
+            )
+            return result
+        _per_profile_running.update(other_profile_counts)
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+            profile = str(prow["assignee"])
+            _per_profile_running[profile] = (
+                _per_profile_running.get(profile, 0) + int(prow["n"])
+            )
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -10145,6 +10226,9 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        if row["id"] in _excluded_task_ids:
+            result.skipped_excluded.append(row["id"])
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
