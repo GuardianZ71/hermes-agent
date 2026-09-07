@@ -116,11 +116,19 @@ def test_real_schema_dry_run_exports_canonical_payload_without_dispatch(tmp_path
     conn.commit(); conn.close()
     usage = mod.Usage(True, 95, 5, None, "pro", mod.iso())
     state_path = tmp_path / "state.json"
+    calls = []
+
+    def dispatch(slug, slots, dry_run, excluded, admitted, policy):
+        calls.append((slug, slots, list(excluded), list(admitted)))
+        return {"spawned": []}
+
     result = mod.run_once(root=root, state_path=state_path, usage=usage, dry_run=True,
-                          dispatch=lambda *args: pytest.fail("no ready work should dispatch"))
+                          dispatch=dispatch)
     assert result["version"] == 2
     assert result["activeWorkers"] == 1
     assert result["outcomeChains"][0]["outcome"] == "POL-126"
+    assert [call[0] for call in calls] == list(mod.BOARDS)
+    assert all(call[3] == [] for call in calls)
     assert state_path.exists()
 
 
@@ -157,14 +165,21 @@ def test_collision_exclusion_does_not_close_unrelated_admission(tmp_path: Path):
     conn.commit(); conn.close()
     calls = []
 
-    def dispatch(slug, slots, dry_run, excluded, policy):
-        calls.append((slug, slots, dry_run, list(excluded), policy))
+    def dispatch(slug, slots, dry_run, excluded, admitted, policy):
+        calls.append(
+            (slug, slots, dry_run, list(excluded), list(admitted), policy)
+        )
         return {"spawned": []}
 
     usage = mod.Usage(True, 95, 5, None, "pro", mod.iso())
     result = mod.run_once(root=root, state_path=tmp_path / "state.json", usage=usage,
                           dry_run=True, dispatch=dispatch)
-    assert calls == [("surveyor", 4, True, ["duplicate"], mod.Policy())]
+    assert [call[0] for call in calls] == list(mod.BOARDS)
+    surveyor = next(call for call in calls if call[0] == "surveyor")
+    assert surveyor == (
+        "surveyor", 4, True, ["duplicate"], ["unrelated"], mod.Policy()
+    )
+    assert all(call[4] == [] for call in calls if call[0] != "surveyor")
     assert result["safeRepair"] == {"mode": "dispatch_exclusion", "mutatedCards": False}
 
 
@@ -188,7 +203,14 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
     monkeypatch.setattr(mod, "board_dispatch_cap", lambda slug, slots: 7)
     monkeypatch.setattr(mod.subprocess, "run", run)
     policy = mod.Policy(max_background_workers=7, max_workers_per_profile=1)
-    result = mod.native_dispatch("surveyor", 3, True, ["t_two", "t_one"], policy)
+    result = mod.native_dispatch(
+        "surveyor",
+        3,
+        True,
+        ["t_two", "t_one"],
+        ["t_three"],
+        policy,
+    )
 
     assert result["status"] == "ok"
     assert captured["command"][:7] == [
@@ -200,7 +222,7 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
         "surveyor",
         "dispatch",
     ]
-    assert captured["command"][-13:] == [
+    assert captured["command"][-16:] == [
         "--max", "7",
         "--max-in-progress", "7",
         "--max-in-progress-per-profile", "1",
@@ -208,6 +230,8 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
         "--json",
         "--exclude-task", "t_one",
         "--exclude-task", "t_two",
+        "--admit-only",
+        "--admit-task", "t_three",
     ]
     assert captured["kwargs"]["cwd"] == mod.AGENT_ROOT
 

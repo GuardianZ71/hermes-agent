@@ -9915,6 +9915,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     excluded_task_ids: Optional[Iterable[str]] = None,
+    admitted_task_ids: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -9963,6 +9964,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             excluded_task_ids=excluded_task_ids,
+            admitted_task_ids=admitted_task_ids,
             reconcile_orphans=reconcile_orphans,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -9994,6 +9996,7 @@ def dispatch_once(
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     excluded_task_ids=excluded_task_ids,
+                    admitted_task_ids=admitted_task_ids,
                     reconcile_orphans=reconcile_orphans,
                 )
                 # Still under both locks: keep the occupancy read and the
@@ -10021,6 +10024,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     excluded_task_ids: Optional[Iterable[str]] = None,
+    admitted_task_ids: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
@@ -10057,6 +10061,10 @@ def _dispatch_once_locked(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+    ``admitted_task_ids`` is an optional snapshot allowlist applied after
+    maintenance and promotion to both ready and review lanes. Passing an empty
+    iterable therefore runs maintenance without admitting any worker, while
+    ``None`` preserves normal dispatch behavior.
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -10175,6 +10183,10 @@ def _dispatch_once_locked(
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
+    _excluded_task_ids = frozenset(excluded_task_ids or ())
+    _admitted_task_ids = (
+        frozenset(admitted_task_ids) if admitted_task_ids is not None else None
+    )
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work
@@ -10187,23 +10199,33 @@ def _dispatch_once_locked(
     # (assigned + real profile) so a review column full of human-pulled
     # control-plane lanes doesn't permanently tax ready throughput.
     def _any_spawnable_review() -> bool:
-        if not review_rows:
+        eligible_review_rows = [
+            row for row in review_rows
+            if (
+                row["id"] not in _excluded_task_ids
+                and (
+                    _admitted_task_ids is None
+                    or row["id"] in _admitted_task_ids
+                )
+            )
+        ]
+        if not eligible_review_rows:
             return False
         try:
             from hermes_cli.profiles import profile_exists as _rpe
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
+            return any(row["assignee"] for row in eligible_review_rows)
         return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+            row["assignee"] and _rpe(row["assignee"])
+            for row in eligible_review_rows
         )
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
         ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
-    _excluded_task_ids = frozenset(excluded_task_ids or ())
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -10254,7 +10276,13 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
-        if row["id"] in _excluded_task_ids:
+        if (
+            row["id"] in _excluded_task_ids
+            or (
+                _admitted_task_ids is not None
+                and row["id"] not in _admitted_task_ids
+            )
+        ):
             result.skipped_excluded.append(row["id"])
             continue
         row_assignee = row["assignee"]
@@ -10462,6 +10490,15 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        if (
+            row["id"] in _excluded_task_ids
+            or (
+                _admitted_task_ids is not None
+                and row["id"] not in _admitted_task_ids
+            )
+        ):
+            result.skipped_excluded.append(row["id"])
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue

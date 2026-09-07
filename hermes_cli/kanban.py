@@ -804,6 +804,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Do not admit this ready task during this pass (repeatable)",
     )
     p_disp.add_argument(
+        "--admit-only", action="store_true",
+        help="Admit only ready tasks named by --admit-task during this pass",
+    )
+    p_disp.add_argument(
+        "--admit-task", action="append", default=[],
+        help="Ready task eligible when --admit-only is set (repeatable)",
+    )
+    p_disp.add_argument(
         "--max-in-progress", type=int, default=None,
         help="Override the host-wide running-worker cap for this pass",
     )
@@ -2813,6 +2821,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             excluded_task_ids=getattr(args, "exclude_task", None),
+            admitted_task_ids=(
+                getattr(args, "admit_task", None)
+                if getattr(args, "admit_only", False)
+                else None
+            ),
         )
     if getattr(args, "json", False):
         print(json.dumps({

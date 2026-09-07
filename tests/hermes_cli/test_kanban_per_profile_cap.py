@@ -166,3 +166,44 @@ def test_dispatch_exclusion_skips_only_named_candidate(
     assert [item[0] for item in result.spawned] == [allowed]
 
 
+def test_dispatch_allowlist_holds_tasks_promoted_during_the_tick(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Test")
+    with kb.connect_closing() as conn:
+        known = kb.create_task(conn, title="known", assignee="alpha")
+        late = kb.create_task(conn, title="late", assignee="beta")
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (late,))
+        conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            admitted_task_ids=[known],
+        )
+    assert result.promoted == 1
+    assert [item[0] for item in result.spawned] == [known]
+    assert late in result.skipped_excluded
+
+
+def test_empty_dispatch_allowlist_blocks_ready_and_review_lanes(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Test")
+    with kb.connect_closing() as conn:
+        ready = kb.create_task(conn, title="ready", assignee="alpha")
+        review = kb.create_task(conn, title="review", assignee="beta")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
+        conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            admitted_task_ids=[],
+        )
+    assert result.spawned == []
+    assert set(result.skipped_excluded) == {ready, review}
+
+

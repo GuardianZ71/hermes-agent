@@ -337,6 +337,7 @@ def native_dispatch(
     slots: int,
     dry_run: bool,
     excluded: Iterable[str] = (),
+    admitted: Iterable[str] = (),
     policy: Policy = Policy(),
 ) -> dict[str, Any]:
     # Invoke the module from the canonical source checkout rather than the
@@ -356,6 +357,9 @@ def native_dispatch(
     ]
     for task_id in sorted(set(excluded)):
         command += ["--exclude-task", task_id]
+    command.append("--admit-only")
+    for task_id in sorted(set(admitted)):
+        command += ["--admit-task", task_id]
     env = dict(os.environ)
     env.pop("HERMES_PROFILE", None)
     env.update({"HOME": str(Path.home()), "HERMES_HOME": str(HOME), "HERMES_KANBAN_BOARD": slug})
@@ -378,7 +382,7 @@ def native_dispatch(
 
 def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: Policy = Policy(),
              usage: Usage | None = None, dry_run: bool = False,
-             dispatch: Callable[[str, int, bool, Iterable[str], Policy], dict[str, Any]] = native_dispatch) -> dict[str, Any]:
+             dispatch: Callable[[str, int, bool, Iterable[str], Iterable[str], Policy], dict[str, Any]] = native_dispatch) -> dict[str, Any]:
     now = time.time()
     previous = load(state_path)
     current_usage = usage or cached_usage(previous, now, policy.usage_refresh_seconds) or fetch_usage()
@@ -395,15 +399,35 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
     start = BOARDS.index(cursor) if cursor in BOARDS else 0
     order = BOARDS[start:] + BOARDS[:start]
     next_board = cursor
-    if not admission_closed and slots:
-        for slug in order:
-            ready = sum(1 for task in tasks if task.board == slug and task.status == "ready")
-            if not ready or slots <= 0:
-                continue
-            excluded = [item["task"]["taskId"] for item in integrity["heldCandidates"] if item["task"]["board"] == slug]
-            action = dispatch(slug, slots, dry_run, excluded, policy)
-            actions.append(action)
-            slots -= spawned_count(action)
+    held_by_board = {
+        slug: {
+            item["task"]["taskId"]
+            for item in integrity["heldCandidates"]
+            if item["task"]["board"] == slug
+        }
+        for slug in BOARDS
+    }
+    unreadable_boards = set(unreadable)
+    for slug in order:
+        if slug in unreadable_boards:
+            continue
+        excluded = held_by_board[slug]
+        admitted = []
+        if not admission_closed and slots > 0:
+            admitted = [
+                task.task_id
+                for task in tasks
+                if (
+                    task.board == slug
+                    and task.status in {"ready", "review"}
+                    and task.task_id not in excluded
+                )
+            ]
+        action = dispatch(slug, slots, dry_run, excluded, admitted, policy)
+        actions.append(action)
+        count = spawned_count(action)
+        slots = max(0, slots - count)
+        if count:
             next_board = BOARDS[(BOARDS.index(slug) + 1) % len(BOARDS)]
     # Always re-read after dispatch so one canonical payload is authoritative.
     tasks, edges, unreadable = read_fleet(root)
