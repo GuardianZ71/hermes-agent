@@ -41,6 +41,12 @@ def test_post_deploy_live_acceptance_is_not_downgraded_to_release():
     assert task("accept", title="Post-deploy live acceptance").stage == "live_acceptance"
 
 
+def test_review_finding_remediation_remains_a_build_writer():
+    item = task("fix", title="Remediate PR #315 review findings")
+    assert item.stage == "build"
+    assert item.writer is True
+
+
 def test_two_active_build_writers_in_one_outcome_are_collision():
     tasks = [task("a", status="running"), task("b", status="running")]
     result = mod.analyze(tasks, [], [], mod.Policy())
@@ -151,14 +157,14 @@ def test_collision_exclusion_does_not_close_unrelated_admission(tmp_path: Path):
     conn.commit(); conn.close()
     calls = []
 
-    def dispatch(slug, slots, dry_run, excluded):
-        calls.append((slug, slots, dry_run, list(excluded)))
+    def dispatch(slug, slots, dry_run, excluded, policy):
+        calls.append((slug, slots, dry_run, list(excluded), policy))
         return {"spawned": []}
 
     usage = mod.Usage(True, 95, 5, None, "pro", mod.iso())
     result = mod.run_once(root=root, state_path=tmp_path / "state.json", usage=usage,
                           dry_run=True, dispatch=dispatch)
-    assert calls == [("surveyor", 4, True, ["duplicate"])]
+    assert calls == [("surveyor", 4, True, ["duplicate"], mod.Policy())]
     assert result["safeRepair"] == {"mode": "dispatch_exclusion", "mutatedCards": False}
 
 
@@ -181,7 +187,8 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
 
     monkeypatch.setattr(mod, "board_dispatch_cap", lambda slug, slots: 7)
     monkeypatch.setattr(mod.subprocess, "run", run)
-    result = mod.native_dispatch("surveyor", 3, True, ["t_two", "t_one"])
+    policy = mod.Policy(max_background_workers=7, max_workers_per_profile=1)
+    result = mod.native_dispatch("surveyor", 3, True, ["t_two", "t_one"], policy)
 
     assert result["status"] == "ok"
     assert captured["command"][:7] == [
@@ -195,8 +202,8 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
     ]
     assert captured["command"][-13:] == [
         "--max", "7",
-        "--max-in-progress", "5",
-        "--max-in-progress-per-profile", "2",
+        "--max-in-progress", "7",
+        "--max-in-progress-per-profile", "1",
         "--failure-limit", "2",
         "--json",
         "--exclude-task", "t_one",

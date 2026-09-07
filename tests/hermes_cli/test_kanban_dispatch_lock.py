@@ -77,3 +77,19 @@ def test_lock_is_board_scoped(conn):
             assert held_b is True, "a lock on a different board must be independent"
 
 
+def test_fleet_cap_dispatch_uses_one_cross_board_admission_lock(conn):
+    """A concurrent capped tick cannot race another board's occupancy read."""
+    fleet_lock_key = kb.kanban_home() / "kanban" / ".fleet-admission"
+    with kb._dispatch_tick_lock(fleet_lock_key, fail_closed=True) as held:
+        assert held is True
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_in_progress=5,
+            max_in_progress_per_profile=2,
+        )
+
+    assert result.skipped_locked is True
+    assert result.spawned == []
+
+
