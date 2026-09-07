@@ -195,6 +195,24 @@ def test_count_running_tasks_other_boards_fails_closed(
     assert res.spawned == []
 
 
+def test_named_board_dispatch_ignores_never_initialized_default_board(
+    kanban_home, monkeypatch,
+):
+    named = "named-only"
+    kb.create_board(slug=named, name="Named")
+    default_path = kb.kanban_db_path(board="default")
+    default_path.unlink(missing_ok=True)
+    kb._INITIALIZED_PATHS.discard(str(default_path.resolve()))
+
+    monkeypatch.setattr(
+        kb,
+        "list_boards",
+        lambda **kwargs: [{"slug": "default"}, {"slug": named}],
+    )
+    assert kb.count_running_tasks_other_boards(board=named) == 0
+    assert kb.count_running_tasks_by_profile_other_boards(board=named) == {}
+
+
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
     """``max_spawn`` keeps its historical per-board semantics."""
     kb.create_board("second")

@@ -1692,7 +1692,7 @@ def _cross_process_init_lock(path: Path):
 
 
 @contextlib.contextmanager
-def _dispatch_tick_lock(db_path: Path):
+def _dispatch_tick_lock(db_path: Path, *, fail_closed: bool = False):
     """Non-blocking single-writer guard around one dispatcher tick.
 
     Yields ``True`` when this process holds the board's dispatch lock and
@@ -1750,8 +1750,9 @@ def _dispatch_tick_lock(db_path: Path):
                 acquired = False
     except OSError:
         # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # The historical board-only guard degrades to a no-op. Fleet admission
+        # is a capacity boundary, so its caller opts into fail-closed behavior.
+        acquired = not fail_closed
         handle = None
     try:
         yield acquired
@@ -9808,6 +9809,10 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> Optional[in
             resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
                 continue
+            if not path.exists() and slug == DEFAULT_BOARD:
+                # list_boards() intentionally synthesizes the legacy default
+                # board before its database has ever been initialized.
+                continue
             if not path.exists():
                 return None
             other = connect(board=slug)
@@ -9853,6 +9858,8 @@ def count_running_tasks_by_profile_other_boards(
             path = kanban_db_path(board=slug).expanduser()
             resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists() and slug == DEFAULT_BOARD:
                 continue
             if not path.exists():
                 return None
@@ -9921,13 +9928,25 @@ def dispatch_once(
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
     the holder is already making progress on the same board.
 
-    The lock is keyed off the board's resolved DB path, so unrelated
-    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
-    cross-process / cross-platform mechanics.
+    When a fleet or per-profile occupancy cap is active, it first acquires one
+    shared fleet-admission lock. That makes the cross-board occupancy read and
+    resulting claims atomic; uncapped unrelated boards retain their historical
+    parallel behavior. See :func:`_dispatch_tick_lock` for the cross-process /
+    cross-platform mechanics.
     """
+    fleet_lock_required = (
+        max_in_progress is not None or max_in_progress_per_profile is not None
+    )
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
+        if fleet_lock_required:
+            _log.error(
+                "kanban dispatch: board path is unreadable; fleet admission is closed"
+            )
+            result = DispatchResult()
+            _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+            return result
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
         # rather than dropping work.
@@ -9948,29 +9967,38 @@ def dispatch_once(
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
-    with _dispatch_tick_lock(db_path) as held:
-        if not held:
+    with contextlib.ExitStack() as locks:
+        fleet_held = True
+        if fleet_lock_required:
+            fleet_lock_key = kanban_home() / "kanban" / ".fleet-admission"
+            fleet_held = locks.enter_context(
+                _dispatch_tick_lock(fleet_lock_key, fail_closed=True)
+            )
+        if not fleet_held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _dispatch_once_locked(
-                conn,
-                spawn_fn=spawn_fn,
-                ttl_seconds=ttl_seconds,
-                dry_run=dry_run,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
-                failure_limit=failure_limit,
-                stale_timeout_seconds=stale_timeout_seconds,
-                board=board,
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-                excluded_task_ids=excluded_task_ids,
-                reconcile_orphans=reconcile_orphans,
-            )
-            # Still under the dispatch lock: run the periodic PASSIVE WAL
-            # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
-            # bounded by journal_size_limit on the writer's natural reset).
-            _maybe_checkpoint_wal(conn, db_path)
+            held = locks.enter_context(_dispatch_tick_lock(db_path))
+            if not held:
+                result = DispatchResult(skipped_locked=True)
+            else:
+                result = _dispatch_once_locked(
+                    conn,
+                    spawn_fn=spawn_fn,
+                    ttl_seconds=ttl_seconds,
+                    dry_run=dry_run,
+                    max_spawn=max_spawn,
+                    max_in_progress=max_in_progress,
+                    failure_limit=failure_limit,
+                    stale_timeout_seconds=stale_timeout_seconds,
+                    board=board,
+                    default_assignee=default_assignee,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                    excluded_task_ids=excluded_task_ids,
+                    reconcile_orphans=reconcile_orphans,
+                )
+                # Still under both locks: keep the occupancy read and the
+                # resulting claims atomic across every board in the fleet.
+                _maybe_checkpoint_wal(conn, db_path)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend

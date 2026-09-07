@@ -79,12 +79,18 @@ class Task:
     def stage(self) -> str:
         title = self.title.lower()
         text = self.text.lower()
-        if re.search(r"\b(re-?review|review)\b", title) or "independent exact-head review" in text:
-            return "exact_head_review"
         if re.search(r"\b(live acceptance|acceptance|live verify|verify live)\b", title):
             return "live_acceptance"
         if re.search(r"\b(release|merge|deploy|promote)\b", title):
             return "release"
+        if (
+            "[review]" in title
+            or re.search(r"\b(?:independent|exact-head|fresh) (?:exact-head )?review\b", title)
+            or re.search(r"^(?:re-?review|review)\b", title)
+            or re.search(r"\breview pr\s*#?\d+\b", title)
+            or "independent exact-head review" in text
+        ):
+            return "exact_head_review"
         return "build"
 
     @property
@@ -326,7 +332,13 @@ def board_dispatch_cap(slug: str, additional_slots: int, root: Path = BOARD_ROOT
     return max(1, running + max(0, int(additional_slots)))
 
 
-def native_dispatch(slug: str, slots: int, dry_run: bool, excluded: Iterable[str] = ()) -> dict[str, Any]:
+def native_dispatch(
+    slug: str,
+    slots: int,
+    dry_run: bool,
+    excluded: Iterable[str] = (),
+    policy: Policy = Policy(),
+) -> dict[str, Any]:
     # Invoke the module from the canonical source checkout rather than the
     # generated console-script wrapper.  A copied runtime governor lives under
     # the Forge profile, while the dispatcher flags ship in AGENT_ROOT; pinning
@@ -337,8 +349,8 @@ def native_dispatch(slug: str, slots: int, dry_run: bool, excluded: Iterable[str
         command.append("--dry-run")
     command += [
         "--max", str(board_dispatch_cap(slug, slots)),
-        "--max-in-progress", "5",
-        "--max-in-progress-per-profile", "2",
+        "--max-in-progress", str(policy.max_background_workers),
+        "--max-in-progress-per-profile", str(policy.max_workers_per_profile),
         "--failure-limit", "2",
         "--json",
     ]
@@ -366,7 +378,7 @@ def native_dispatch(slug: str, slots: int, dry_run: bool, excluded: Iterable[str
 
 def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: Policy = Policy(),
              usage: Usage | None = None, dry_run: bool = False,
-             dispatch: Callable[[str, int, bool, Iterable[str]], dict[str, Any]] = native_dispatch) -> dict[str, Any]:
+             dispatch: Callable[[str, int, bool, Iterable[str], Policy], dict[str, Any]] = native_dispatch) -> dict[str, Any]:
     now = time.time()
     previous = load(state_path)
     current_usage = usage or cached_usage(previous, now, policy.usage_refresh_seconds) or fetch_usage()
@@ -389,7 +401,7 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
             if not ready or slots <= 0:
                 continue
             excluded = [item["task"]["taskId"] for item in integrity["heldCandidates"] if item["task"]["board"] == slug]
-            action = dispatch(slug, slots, dry_run, excluded)
+            action = dispatch(slug, slots, dry_run, excluded, policy)
             actions.append(action)
             slots -= spawned_count(action)
             next_board = BOARDS[(BOARDS.index(slug) + 1) % len(BOARDS)]
