@@ -5,7 +5,7 @@ import fcntl
 import sqlite3
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+
 
 import pytest
 
@@ -193,15 +193,23 @@ def test_cron_and_event_wakeups_share_admission_lock(tmp_path: Path):
 
 
 def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
+    from hermes_cli import kanban_db as kb
+
     captured = {}
 
-    def run(command, **kwargs):
-        captured["command"] = command
+    class Connection:
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(kb, "connect", lambda **kwargs: Connection())
+
+    def dispatch_once(conn, **kwargs):
+        captured["conn"] = conn
         captured["kwargs"] = kwargs
-        return SimpleNamespace(returncode=0, stdout='{"spawned": []}', stderr="")
+        return kb.DispatchResult()
 
     monkeypatch.setattr(mod, "board_dispatch_cap", lambda slug, slots: 7)
-    monkeypatch.setattr(mod.subprocess, "run", run)
+    monkeypatch.setattr(kb, "dispatch_once", dispatch_once)
     policy = mod.Policy(max_background_workers=7, max_workers_per_profile=1)
     result = mod.native_dispatch(
         "surveyor",
@@ -213,27 +221,38 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
     )
 
     assert result["status"] == "ok"
-    assert captured["command"][:7] == [
-        str(mod.PYTHON),
-        "-m",
-        "hermes_cli.main",
-        "kanban",
-        "--board",
-        "surveyor",
-        "dispatch",
-    ]
-    assert captured["command"][-16:] == [
-        "--max", "7",
-        "--max-in-progress", "7",
-        "--max-in-progress-per-profile", "1",
-        "--failure-limit", "2",
-        "--json",
-        "--exclude-task", "t_one",
-        "--exclude-task", "t_two",
-        "--admit-only",
-        "--admit-task", "t_three",
-    ]
-    assert captured["kwargs"]["cwd"] == mod.AGENT_ROOT
+    assert captured["closed"] is True
+    assert captured["kwargs"] == {
+        "board": "surveyor",
+        "dry_run": True,
+        "max_spawn": 7,
+        "max_in_progress": 7,
+        "failure_limit": 2,
+        "max_in_progress_per_profile": 1,
+        "excluded_task_ids": ["t_one", "t_two"],
+        "admitted_task_ids": ["t_three"],
+        "admission_authority": mod.ADMISSION_AUTHORITY,
+        "fleet_admission_lock_held": True,
+    }
+
+
+def test_final_unreadable_snapshot_overrides_earlier_green_capacity(
+    tmp_path: Path, monkeypatch,
+):
+    reads = iter([([], [], []), ([], [], ["surveyor"])])
+    monkeypatch.setattr(mod, "read_fleet", lambda root: next(reads))
+    usage = mod.Usage(True, 95, 5, None, "pro", mod.iso())
+    result = mod.run_once(
+        root=tmp_path,
+        state_path=tmp_path / "state.json",
+        usage=usage,
+        dry_run=True,
+        dispatch=lambda *args: {"spawned": []},
+    )
+    assert result["state"] == "red"
+    assert result["capacity"] == 0
+    assert result["availableSlots"] == 0
+    assert result["integrity"]["readable"] is False
 
 
 def test_cached_usage_is_bounded_by_policy_age():
