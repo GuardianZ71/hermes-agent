@@ -997,6 +997,41 @@ def test_respawn_guard_generic_status_after_pr_does_not_authorize(kanban_home):
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
 
 
+def test_respawn_guard_automatic_reclaim_after_pr_does_not_authorize(kanban_home):
+    """Stale-worker recovery is not intentional continuation authority."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="auto-reclaim", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/46", now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'reclaimed', ?, ?)",
+            (task_id, '{"manual": false}', now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_explicit_continuation_event_after_pr_authorizes(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="manual-continuation", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/47", now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'continuation_authorized', ?, ?)",
+            (task_id, '{"reason": "continue existing PR"}', now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------

@@ -5186,6 +5186,14 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
+        if reason:
+            _append_event(
+                conn,
+                task_id,
+                "continuation_authorized",
+                {"source": "manual_reclaim", "reason": reason},
+                run_id=run_id,
+            )
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
@@ -9536,7 +9544,7 @@ def check_respawn_guard(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
             "AND kind IN ('status', 'promoted', 'promoted_manual', "
-            "'unblocked', 'reclaimed') "
+            "'unblocked', 'continuation_authorized') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -9567,7 +9575,8 @@ def check_respawn_guard(
         continuation = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at > ? AND id > ? "
-            "AND kind IN ('promoted_manual', 'unblocked', 'reclaimed', "
+            "AND kind IN ('promoted_manual', 'unblocked', "
+            "'continuation_authorized', "
             "'changes_requested', 'review_reopened') "
             "ORDER BY id DESC LIMIT 1",
             (task_id, latest_pr_comment_at, latest_claim_id),
@@ -9917,6 +9926,8 @@ def dispatch_once(
     excluded_task_ids: Optional[Iterable[str]] = None,
     admitted_task_ids: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
+    admission_authority: Optional[str] = None,
+    fleet_admission_lock_held: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9935,6 +9946,16 @@ def dispatch_once(
     parallel behavior. See :func:`_dispatch_tick_lock` for the cross-process /
     cross-platform mechanics.
     """
+    configured_authority = str(
+        read_board_metadata(board).get("admission_authority") or ""
+    ).strip()
+    if configured_authority and admission_authority != configured_authority:
+        # Governed boards still run maintenance/reconciliation, but only the
+        # configured authority may admit workers. This closes gateway,
+        # dashboard, and direct-dispatch bypasses without disabling stale-
+        # claim and dependency maintenance.
+        admitted_task_ids = ()
+
     fleet_lock_required = (
         max_in_progress is not None or max_in_progress_per_profile is not None
     )
@@ -9971,7 +9992,7 @@ def dispatch_once(
         return result
     with contextlib.ExitStack() as locks:
         fleet_held = True
-        if fleet_lock_required:
+        if fleet_lock_required and not fleet_admission_lock_held:
             fleet_lock_key = kanban_home() / "kanban" / ".fleet-admission"
             fleet_held = locks.enter_context(
                 _dispatch_tick_lock(fleet_lock_key, fail_closed=True)

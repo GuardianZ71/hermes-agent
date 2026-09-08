@@ -8,6 +8,7 @@ model / API quota / browser pool from being overwhelmed by a fan-out.
 from __future__ import annotations
 
 import os
+import json
 import sys
 import tempfile
 
@@ -205,5 +206,39 @@ def test_empty_dispatch_allowlist_blocks_ready_and_review_lanes(
         )
     assert result.spawned == []
     assert set(result.skipped_excluded) == {ready, review}
+
+
+def test_governed_board_admits_only_configured_authority(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Governed")
+    metadata = kb.read_board_metadata("default")
+    metadata.pop("db_path", None)
+    metadata["admission_authority"] = "governor-v1"
+    kb.board_metadata_path("default").write_text(json.dumps(metadata))
+
+    with kb.connect_closing(board="default") as conn:
+        task_id = kb.create_task(conn, title="one-owner", assignee="alpha")
+        bypass = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            board="default",
+            max_in_progress=5,
+        )
+        admitted = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            board="default",
+            max_in_progress=5,
+            admitted_task_ids=[task_id],
+            admission_authority="governor-v1",
+        )
+
+    assert bypass.spawned == []
+    assert bypass.skipped_excluded == [task_id]
+    assert [row[0] for row in admitted.spawned] == [task_id]
 
 

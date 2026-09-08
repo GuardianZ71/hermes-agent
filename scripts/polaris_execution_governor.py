@@ -8,7 +8,7 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
+import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
@@ -25,6 +25,7 @@ STATE_PATH = HOME / "profiles" / "forge" / "state" / "polaris_execution_governor
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 AGENT_ROOT = _SOURCE_ROOT if (_SOURCE_ROOT / "hermes_cli").is_dir() else HOME / "hermes-agent"
 PYTHON = HOME / "hermes-agent" / "venv" / "bin" / "python"
+ADMISSION_AUTHORITY = "polaris-execution-governor-v1"
 LINEAR_RE = re.compile(r"\[linear:(POL-\d+)\]", re.I)
 COLLISION_RE = re.compile(r"\[collision-domain:([^\]]+)\]", re.I)
 PR_URL_RE = re.compile(r"https://github\.com/([^\s/]+/[^\s/]+)/pull/(\d+)", re.I)
@@ -200,7 +201,7 @@ def read_fleet(root: Path) -> tuple[list[Task], list[tuple[str, str, str]], list
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only=ON")
             rows = conn.execute(
-                "SELECT t.id,t.title,t.body,t.assignee,t.status,t.priority,t.created_at," 
+                "SELECT t.id,t.title,t.body,t.assignee,t.status,t.priority,t.created_at,"
                 "COALESCE((SELECT group_concat(c.body,'\\n') FROM task_comments c "
                 "WHERE c.task_id=t.id),'') AS comments FROM tasks t"
             ).fetchall()
@@ -340,44 +341,57 @@ def native_dispatch(
     admitted: Iterable[str] = (),
     policy: Policy = Policy(),
 ) -> dict[str, Any]:
-    # Invoke the module from the canonical source checkout rather than the
-    # generated console-script wrapper.  A copied runtime governor lives under
-    # the Forge profile, while the dispatcher flags ship in AGENT_ROOT; pinning
-    # cwd makes both the repository copy and installed copy load that exact
-    # source tree.
-    command = [str(PYTHON), "-m", "hermes_cli.main", "kanban", "--board", slug, "dispatch"]
-    if dry_run:
-        command.append("--dry-run")
-    command += [
-        "--max", str(board_dispatch_cap(slug, slots)),
-        "--max-in-progress", str(policy.max_background_workers),
-        "--max-in-progress-per-profile", str(policy.max_workers_per_profile),
-        "--failure-limit", "2",
-        "--json",
-    ]
-    for task_id in sorted(set(excluded)):
-        command += ["--exclude-task", task_id]
-    command.append("--admit-only")
-    for task_id in sorted(set(admitted)):
-        command += ["--admit-task", task_id]
-    env = dict(os.environ)
-    env.pop("HERMES_PROFILE", None)
-    env.update({"HOME": str(Path.home()), "HERMES_HOME": str(HOME), "HERMES_KANBAN_BOARD": slug})
-    proc = subprocess.run(
-        command,
-        text=True,
-        capture_output=True,
-        timeout=120,
-        env=env,
-        cwd=AGENT_ROOT,
-    )
+    if str(AGENT_ROOT) not in sys.path:
+        sys.path.insert(0, str(AGENT_ROOT))
+    from hermes_cli import kanban_db as kb
+
+    previous = {
+        name: os.environ.get(name)
+        for name in ("HERMES_PROFILE", "HERMES_HOME", "HERMES_KANBAN_BOARD")
+    }
+    os.environ.pop("HERMES_PROFILE", None)
+    os.environ.update({"HERMES_HOME": str(HOME), "HERMES_KANBAN_BOARD": slug})
+    conn = None
     try:
-        detail = json.loads(proc.stdout) if proc.stdout.strip() else None
-    except json.JSONDecodeError:
-        detail = None
-    return {"board": slug, "requested": slots, "spawned": spawned_count(detail),
-            "status": "ok" if proc.returncode == 0 else "error", "detail": detail,
-            **({"error": (proc.stderr or proc.stdout).strip()[:240]} if proc.returncode else {})}
+        conn = kb.connect(board=slug)
+        result = kb.dispatch_once(
+            conn,
+            board=slug,
+            dry_run=dry_run,
+            max_spawn=board_dispatch_cap(slug, slots),
+            max_in_progress=policy.max_background_workers,
+            failure_limit=2,
+            max_in_progress_per_profile=policy.max_workers_per_profile,
+            excluded_task_ids=sorted(set(excluded)),
+            admitted_task_ids=sorted(set(admitted)),
+            admission_authority=ADMISSION_AUTHORITY,
+            fleet_admission_lock_held=True,
+        )
+        detail = asdict(result)
+        return {
+            "board": slug,
+            "requested": slots,
+            "spawned": spawned_count(detail),
+            "status": "ok",
+            "detail": detail,
+        }
+    except Exception as exc:
+        return {
+            "board": slug,
+            "requested": slots,
+            "spawned": 0,
+            "status": "error",
+            "detail": None,
+            "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: Policy = Policy(),
@@ -433,6 +447,13 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
     tasks, edges, unreadable = read_fleet(root)
     integrity = analyze(tasks, edges, unreadable, policy)
     occupancy = integrity["occupancy"]
+    state, capacity, reason = classify(current_usage.remaining_percent, policy)
+    if unreadable:
+        state, capacity, reason = (
+            "red",
+            0,
+            "Canonical occupancy is unreadable; admission failed closed.",
+        )
     payload = {"version": 2, "generatedAt": iso(), "state": state, "reason": reason,
                "nextBoard": next_board,
                "policy": asdict(policy), "usage": asdict(current_usage), "capacity": capacity,
@@ -487,8 +508,13 @@ def main() -> int:
         max_workers_per_profile=args.max_workers_per_profile,
     )
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with STATE_PATH.with_suffix(".lock").open("a+") as lock:
-        if not acquire_admission_lock(lock, args.lock_timeout):
+    if str(AGENT_ROOT) not in sys.path:
+        sys.path.insert(0, str(AGENT_ROOT))
+    from hermes_cli import kanban_db as kb
+
+    fleet_key = kb.kanban_home() / "kanban" / ".fleet-admission"
+    with kb._dispatch_tick_lock(fleet_key, fail_closed=True) as held:
+        if not held:
             return 0
         print(json.dumps(run_once(dry_run=args.dry_run, policy=policy), sort_keys=True))
     return 0
