@@ -458,16 +458,39 @@ def acquire_admission_lock(lock: Any, timeout_seconds: float = 0) -> bool:
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--lock-timeout", type=float, default=0.0)
+    parser.add_argument(
+        "--max-background-workers",
+        type=positive_int,
+        default=positive_int(os.environ.get("POLARIS_MAX_BACKGROUND_WORKERS", "5")),
+        help="Fleet-wide admission limit (default 5; set to 1 for canary activation).",
+    )
+    parser.add_argument(
+        "--max-workers-per-profile",
+        type=positive_int,
+        default=positive_int(os.environ.get("POLARIS_MAX_WORKERS_PER_PROFILE", "2")),
+        help="Fleet-wide per-profile admission limit (default 2).",
+    )
     args = parser.parse_args()
+    policy = Policy(
+        max_background_workers=args.max_background_workers,
+        max_workers_per_profile=args.max_workers_per_profile,
+    )
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with STATE_PATH.with_suffix(".lock").open("a+") as lock:
         if not acquire_admission_lock(lock, args.lock_timeout):
             return 0
-        print(json.dumps(run_once(dry_run=args.dry_run), sort_keys=True))
+        print(json.dumps(run_once(dry_run=args.dry_run, policy=policy), sort_keys=True))
     return 0
 
 
