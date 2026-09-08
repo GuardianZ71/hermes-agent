@@ -195,6 +195,20 @@ def test_count_running_tasks_other_boards_fails_closed(
     assert res.spawned == []
 
 
+def test_current_board_occupancy_read_fails_closed(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    spawns: list = []
+    with kb.connect() as conn:
+        kb.create_task(conn, title="must-wait", assignee="alice")
+        monkeypatch.setattr(kb, "count_running_tasks", lambda _conn: None)
+        result = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=5,
+        )
+    assert spawns == []
+    assert result.spawned == []
+
+
 def test_named_board_dispatch_ignores_never_initialized_default_board(
     kanban_home, monkeypatch,
 ):
