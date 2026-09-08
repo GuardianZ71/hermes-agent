@@ -241,3 +241,9 @@ def test_cached_usage_is_bounded_by_policy_age():
     previous = {"usage": mod.asdict(usage)}
     assert mod.cached_usage(previous, 1000, 300).remaining_percent == 88
     assert mod.cached_usage(previous, 2000, 300) is None
+
+
+def test_positive_int_accepts_canary_limit_and_rejects_zero():
+    assert mod.positive_int("1") == 1
+    with pytest.raises(Exception, match="at least 1"):
+        mod.positive_int("0")
