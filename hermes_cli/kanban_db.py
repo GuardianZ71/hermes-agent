@@ -9760,15 +9760,16 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
-def count_running_tasks(conn: sqlite3.Connection) -> int:
+def count_running_tasks(conn: sqlite3.Connection) -> Optional[int]:
     """Return the number of tasks currently in ``status='running'``.
 
     Used by the gateway's multi-board sweep to account for workers on
     OTHER boards against the host-level concurrency budget (OOF-30): the
     memory-derived cap bounds the machine, so each board's tick must see
-    the machine's total, not just its own. Fails open to 0 — a broken
-    board must not brick dispatch on healthy ones (corruption is handled
-    separately by the watcher's quarantine logic).
+    the machine's total, not just its own. A broken occupancy read returns
+    ``None`` so capped admission fails closed (corruption is handled
+    separately by the watcher's quarantine logic). This is an admission
+    boundary, so unreadable occupancy must fail closed.
     """
     try:
         return int(
@@ -9777,7 +9778,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
             ).fetchone()[0]
         )
     except Exception:
-        return 0
+        return None
 
 
 def count_running_tasks_other_boards(board: Optional[str] = None) -> Optional[int]:
@@ -10123,7 +10124,14 @@ def _dispatch_once_locked(
     running_count = 0
     spawn_budget: Optional[int] = None
     if max_spawn is not None or max_in_progress is not None:
-        running_count = count_running_tasks(conn)
+        observed_running = count_running_tasks(conn)
+        if observed_running is None:
+            _log.error(
+                "kanban dispatch: current-board occupancy is unreadable; "
+                "admitting no new workers this tick"
+            )
+            return result
+        running_count = observed_running
 
     # Convert any concurrency caps into a shared additional-spawns budget
     # for this tick. Both ready and review loops consume from the same

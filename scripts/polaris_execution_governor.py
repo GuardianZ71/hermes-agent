@@ -137,6 +137,21 @@ def load(path: Path) -> dict[str, Any]:
         return {}
 
 
+def admission_authority_errors(root: Path = BOARD_ROOT) -> list[str]:
+    """Return canonical boards not durably enrolled under this governor."""
+    errors: list[str] = []
+    for slug in BOARDS:
+        metadata_path = root / slug / "board.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            errors.append(f"{slug}:authority-unreadable")
+            continue
+        if not isinstance(metadata, dict) or metadata.get("admission_authority") != ADMISSION_AUTHORITY:
+            errors.append(f"{slug}:authority-mismatch")
+    return errors
+
+
 def cached_usage(previous: dict[str, Any], now: float, max_age: int) -> Usage | None:
     raw = previous.get("usage")
     if not isinstance(raw, dict) or not isinstance(raw.get("fetched_at"), str):
@@ -340,6 +355,16 @@ def native_dispatch(
     admitted: Iterable[str] = (),
     policy: Policy = Policy(),
 ) -> dict[str, Any]:
+    authority_errors = admission_authority_errors(BOARD_ROOT)
+    if authority_errors:
+        return {
+            "board": slug,
+            "requested": slots,
+            "spawned": 0,
+            "status": "error",
+            "detail": None,
+            "error": "canonical admission authority is not enrolled: " + ", ".join(authority_errors),
+        }
     if str(AGENT_ROOT) not in sys.path:
         sys.path.insert(0, str(AGENT_ROOT))
     from hermes_cli import kanban_db as kb
@@ -401,6 +426,7 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
     current_usage = usage or cached_usage(previous, now, policy.usage_refresh_seconds) or fetch_usage()
     state, capacity, reason = classify(current_usage.remaining_percent, policy)
     tasks, edges, unreadable = read_fleet(root)
+    unreadable.extend(admission_authority_errors(root))
     integrity = analyze(tasks, edges, unreadable, policy)
     occupancy = integrity["occupancy"]
     actions: list[dict[str, Any]] = []
@@ -420,7 +446,7 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
         }
         for slug in BOARDS
     }
-    unreadable_boards = set(unreadable)
+    unreadable_boards = {item.split(":", 1)[0] for item in unreadable}
     for slug in order:
         if slug in unreadable_boards:
             continue
@@ -444,6 +470,7 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
             next_board = BOARDS[(BOARDS.index(slug) + 1) % len(BOARDS)]
     # Always re-read after dispatch so one canonical payload is authoritative.
     tasks, edges, unreadable = read_fleet(root)
+    unreadable.extend(admission_authority_errors(root))
     integrity = analyze(tasks, edges, unreadable, policy)
     occupancy = integrity["occupancy"]
     state, capacity, reason = classify(current_usage.remaining_percent, policy)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -92,9 +93,31 @@ def test_unreadable_board_closes_admission_with_stable_incident(tmp_path: Path):
     assert [item["id"] for item in result["integrity"]["incidents"]].count("occupancy-unreadable") == 1
 
 
+def test_missing_or_mismatched_board_authority_closes_admission(tmp_path: Path):
+    root = tmp_path / "boards"
+    for slug in mod.BOARDS:
+        conn = _make_board(root, slug)
+        conn.close()
+    (root / "surveyor" / "board.json").write_text(json.dumps({"slug": "surveyor"}))
+    usage = mod.Usage(True, 95, 5, None, "pro", mod.iso())
+    calls = []
+    result = mod.run_once(
+        root=root, state_path=tmp_path / "state.json", usage=usage, dry_run=True,
+        dispatch=lambda *args: calls.append(args) or {},
+    )
+    assert result["state"] == "red"
+    assert result["capacity"] == 0
+    assert all(args[0] != "surveyor" for args in calls)
+    assert "surveyor:authority-mismatch" in result["integrity"]["incidents"][0]["boards"]
+
+
 def _make_board(root: Path, slug: str) -> sqlite3.Connection:
     folder = root / slug
     folder.mkdir(parents=True)
+    (folder / "board.json").write_text(json.dumps({
+        "slug": slug,
+        "admission_authority": mod.ADMISSION_AUTHORITY,
+    }))
     conn = sqlite3.connect(folder / "kanban.db")
     conn.executescript("""
       CREATE TABLE tasks(id TEXT PRIMARY KEY,title TEXT,body TEXT,assignee TEXT,status TEXT,priority INTEGER,created_at INTEGER);
@@ -199,6 +222,7 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
         return kb.DispatchResult()
 
     monkeypatch.setattr(mod, "board_dispatch_cap", lambda slug, slots: 7)
+    monkeypatch.setattr(mod, "admission_authority_errors", lambda root=mod.BOARD_ROOT: [])
     monkeypatch.setattr(kb, "dispatch_once", dispatch_once)
     policy = mod.Policy(max_background_workers=7, max_workers_per_profile=1)
     result = mod.native_dispatch(
