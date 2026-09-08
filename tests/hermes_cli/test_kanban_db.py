@@ -1015,6 +1015,31 @@ def test_respawn_guard_automatic_reclaim_after_pr_does_not_authorize(kanban_home
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
 
 
+def test_respawn_guard_manual_reclaim_after_pr_does_not_authorize(kanban_home):
+    """Reclaim and explicit PR continuation remain separate operations."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="manual-reclaim", assignee="alice", initial_status="running"
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock='manual-test-lock' WHERE id=?",
+            (task_id,),
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/47", now - 60),
+        )
+        assert kb.reclaim_task(conn, task_id, reason="recover stopped worker")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'continuation_authorized'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
 def test_respawn_guard_explicit_continuation_event_after_pr_authorizes(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="manual-continuation", assignee="alice")
