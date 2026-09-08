@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import fcntl
 import sqlite3
 import sys
 from pathlib import Path
@@ -183,15 +182,6 @@ def test_collision_exclusion_does_not_close_unrelated_admission(tmp_path: Path):
     assert result["safeRepair"] == {"mode": "dispatch_exclusion", "mutatedCards": False}
 
 
-def test_cron_and_event_wakeups_share_admission_lock(tmp_path: Path):
-    lock_path = tmp_path / "admission.lock"
-    with lock_path.open("a+") as first, lock_path.open("a+") as second:
-        assert mod.acquire_admission_lock(first)
-        assert not mod.acquire_admission_lock(second)
-        fcntl.flock(first.fileno(), fcntl.LOCK_UN)
-        assert mod.acquire_admission_lock(second, timeout_seconds=0.1)
-
-
 def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
     from hermes_cli import kanban_db as kb
 
@@ -234,6 +224,21 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
         "admission_authority": mod.ADMISSION_AUTHORITY,
         "fleet_admission_lock_held": True,
     }
+
+
+def test_busy_shared_admission_lock_is_retryable(monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    class BusyLock:
+        def __enter__(self):
+            return False
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(kb, "_dispatch_tick_lock", lambda *args, **kwargs: BusyLock())
+    monkeypatch.setattr(sys, "argv", ["polaris_execution_governor.py", "--dry-run"])
+    assert mod.main() == 75
 
 
 def test_final_unreadable_snapshot_overrides_earlier_green_capacity(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -467,18 +466,6 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
     return payload
 
 
-def acquire_admission_lock(lock: Any, timeout_seconds: float = 0) -> bool:
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
-    while True:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-
-
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
@@ -489,7 +476,7 @@ def positive_int(value: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--lock-timeout", type=float, default=0.0)
+
     parser.add_argument(
         "--max-background-workers",
         type=positive_int,
@@ -515,7 +502,9 @@ def main() -> int:
     fleet_key = kb.kanban_home() / "kanban" / ".fleet-admission"
     with kb._dispatch_tick_lock(fleet_key, fail_closed=True) as held:
         if not held:
-            return 0
+            # Event intake must retain its cursor and retry. Success here would
+            # acknowledge an admission wake that never inspected the fleet.
+            return 75
         print(json.dumps(run_once(dry_run=args.dry_run, policy=policy), sort_keys=True))
     return 0
 
