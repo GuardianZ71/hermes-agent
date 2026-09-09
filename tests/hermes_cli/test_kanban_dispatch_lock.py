@@ -13,6 +13,7 @@ empty ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes.
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -75,5 +76,65 @@ def test_lock_is_board_scoped(conn):
         assert held_a is True
         with kb._dispatch_tick_lock(db_other) as held_b:
             assert held_b is True, "a lock on a different board must be independent"
+
+
+def test_fleet_cap_dispatch_uses_one_cross_board_admission_lock(conn):
+    """A concurrent capped tick cannot race another board's occupancy read."""
+    fleet_lock_key = kb.kanban_home() / "kanban" / ".fleet-admission"
+    with kb._dispatch_tick_lock(fleet_lock_key, fail_closed=True) as held:
+        assert held is True
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_in_progress=5,
+            max_in_progress_per_profile=2,
+        )
+
+    assert result.skipped_locked is True
+    assert result.spawned == []
+
+
+def test_two_real_cross_board_ticks_cannot_exceed_fleet_or_profile_cap(
+    kanban_home, all_assignees_spawnable,
+):
+    for slug in ("a", "b"):
+        kb.create_board(slug=slug, name=slug.upper())
+        with kb.connect(board=slug) as board_conn:
+            kb.create_task(board_conn, title=f"task-{slug}", assignee="alice")
+
+    start = threading.Barrier(2)
+    spawned: list[tuple[str, str]] = []
+    results = []
+    guard = threading.Lock()
+
+    def run(slug: str) -> None:
+        def fake_spawn(task, workspace_path, board=None):
+            with guard:
+                spawned.append((slug, task.id))
+                return 1000 + len(spawned)
+
+        with kb.connect(board=slug) as board_conn:
+            start.wait()
+            result = kb.dispatch_once(
+                board_conn, board=slug, spawn_fn=fake_spawn,
+                max_in_progress=1, max_in_progress_per_profile=1,
+            )
+        with guard:
+            results.append(result)
+
+    threads = [threading.Thread(target=run, args=(slug,)) for slug in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    assert len(spawned) == 1
+    assert sum(len(result.spawned) for result in results) == 1
+    running = 0
+    for slug in ("a", "b"):
+        with kb.connect(board=slug) as board_conn:
+            running += kb.count_running_tasks(board_conn) or 0
+    assert running == 1
 
 

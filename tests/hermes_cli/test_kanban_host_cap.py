@@ -175,15 +175,56 @@ def test_max_in_progress_partial_budget_across_boards(
     assert len(res.spawned) == 1
 
 
-def test_count_running_tasks_other_boards_fails_open(
+def test_count_running_tasks_other_boards_fails_closed(
     kanban_home, monkeypatch,
 ):
-    """A broken board enumeration must not brick dispatch (returns 0)."""
+    """Unknown fleet occupancy must close host-level admission."""
     monkeypatch.setattr(
         kb, "list_boards",
         lambda **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert kb.count_running_tasks_other_boards() == 0
+    assert kb.count_running_tasks_other_boards() is None
+
+    spawns: list = []
+    with kb.connect() as conn:
+        kb.create_task(conn, title="must-wait", assignee="alice")
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=5,
+        )
+    assert spawns == []
+    assert res.spawned == []
+
+
+def test_current_board_occupancy_read_fails_closed(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    spawns: list = []
+    with kb.connect() as conn:
+        kb.create_task(conn, title="must-wait", assignee="alice")
+        monkeypatch.setattr(kb, "count_running_tasks", lambda _conn: None)
+        result = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=5,
+        )
+    assert spawns == []
+    assert result.spawned == []
+
+
+def test_named_board_dispatch_ignores_never_initialized_default_board(
+    kanban_home, monkeypatch,
+):
+    named = "named-only"
+    kb.create_board(slug=named, name="Named")
+    default_path = kb.kanban_db_path(board="default")
+    default_path.unlink(missing_ok=True)
+    kb._INITIALIZED_PATHS.discard(str(default_path.resolve()))
+
+    monkeypatch.setattr(
+        kb,
+        "list_boards",
+        lambda **kwargs: [{"slug": "default"}, {"slug": named}],
+    )
+    assert kb.count_running_tasks_other_boards(board=named) == 0
+    assert kb.count_running_tasks_by_profile_other_boards(board=named) == {}
 
 
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
