@@ -171,3 +171,20 @@ def test_signer_command_rejects_interpreter_or_argument_substitution() -> None:
             "linear",
             ["/usr/bin/sudo", "-n", "-u", "polarisproject", "/usr/local/libexec/polaris-factory-sign-linear"],
         )
+
+
+def test_signer_runs_from_neutral_accessible_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Result:
+        returncode = 0
+        stdout = "signature\n"
+        stderr = ""
+
+    def fake_run(*args: object, **kwargs: object) -> Result:
+        captured.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(intake.subprocess, "run", fake_run)
+    assert intake._sign("linear", {"schema_version": 1}) == "signature"
+    assert captured["cwd"] == "/"

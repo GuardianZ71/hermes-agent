@@ -167,7 +167,7 @@ def _sign(source: str, payload: dict[str, Any]) -> str:
     proc = subprocess.run(
         command,
         input=json.dumps(payload), text=True, encoding="utf-8", errors="replace",
-        capture_output=True, timeout=90,
+        capture_output=True, timeout=90, cwd="/",
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip()[:300])
