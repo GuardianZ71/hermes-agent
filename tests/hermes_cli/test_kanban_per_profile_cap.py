@@ -242,3 +242,42 @@ def test_governed_board_admits_only_configured_authority(
     assert [row[0] for row in admitted.spawned] == [task_id]
 
 
+def test_canonical_polaris_board_without_authority_fails_closed(
+    isolated_kanban_home_with_profiles, monkeypatch,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="polaris-ops", name="Polaris")
+    with kb.connect_closing(board="polaris-ops") as conn:
+        task_id = kb.create_task(conn, title="must-not-bypass", assignee="alpha")
+        direct = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            board="polaris-ops",
+            max_in_progress=5,
+        )
+        wrong_authority = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            board="polaris-ops",
+            max_in_progress=5,
+            admitted_task_ids=[task_id],
+            admission_authority="not-the-governor",
+        )
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "polaris-ops")
+        implicit_cli = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress=5,
+        )
+
+    assert direct.spawned == []
+    assert direct.skipped_excluded == [task_id]
+    assert wrong_authority.spawned == []
+    assert wrong_authority.skipped_excluded == [task_id]
+    assert implicit_cli.spawned == []
+    assert implicit_cli.skipped_excluded == [task_id]
+
+
