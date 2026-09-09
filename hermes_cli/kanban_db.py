@@ -737,6 +737,34 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "kanban.db"
 
 
+def _connected_db_identity(conn: sqlite3.Connection) -> tuple[Optional[Path], Optional[str]]:
+    """Return the actual main DB path and its board slug when locally known.
+
+    The connection is authoritative.  In particular, ``HERMES_KANBAN_DB``
+    may point at a named board while the caller presents that connection as
+    ``default``.  Deriving governance only from the caller's slug would let a
+    canonical board bypass its admission authority.
+    """
+    try:
+        row = next(
+            row for row in conn.execute("PRAGMA database_list")
+            if str(row[1]) == "main"
+        )
+        raw_path = str(row[2] or "").strip()
+        if not raw_path:
+            return None, None
+        path = Path(raw_path).expanduser().resolve()
+        home = kanban_home().expanduser().resolve()
+        if path == (home / "kanban.db").resolve():
+            return path, DEFAULT_BOARD
+        boards = (home / "kanban" / "boards").resolve()
+        if path.name == "kanban.db" and path.parent.parent == boards:
+            return path, _normalize_board_slug(path.parent.name)
+        return path, None
+    except Exception:
+        return None, None
+
+
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
@@ -9941,13 +9969,19 @@ def dispatch_once(
     parallel behavior. See :func:`_dispatch_tick_lock` for the cross-process /
     cross-platform mechanics.
     """
-    resolved_board = board if board else get_current_board()
+    requested_board = _normalize_board_slug(board) if board else None
+    actual_db_path, actual_board = _connected_db_identity(conn)
+    resolved_board = actual_board or requested_board or get_current_board()
+    board_identity_mismatch = bool(
+        requested_board and actual_board and requested_board != actual_board
+    )
     configured_authority = str(
         read_board_metadata(resolved_board).get("admission_authority") or ""
     ).strip()
     governed_polaris_board = resolved_board in POLARIS_CANONICAL_BOARDS
     authority_mismatch = (
-        (governed_polaris_board and configured_authority != POLARIS_ADMISSION_AUTHORITY)
+        board_identity_mismatch
+        or (governed_polaris_board and configured_authority != POLARIS_ADMISSION_AUTHORITY)
         or (configured_authority and admission_authority != configured_authority)
         or (governed_polaris_board and admission_authority != POLARIS_ADMISSION_AUTHORITY)
     )
@@ -9962,7 +9996,7 @@ def dispatch_once(
         max_in_progress is not None or max_in_progress_per_profile is not None
     )
     try:
-        db_path = kanban_db_path(board=board)
+        db_path = actual_db_path or kanban_db_path(board=resolved_board)
     except Exception:
         if fleet_lock_required:
             _log.error(
