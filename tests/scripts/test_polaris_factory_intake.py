@@ -11,6 +11,7 @@ import sys
 import threading
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -78,6 +79,52 @@ def test_snapshot_mapping_binds_team_as_well_as_project_and_repo(monkeypatch) ->
     snapshot, mapping = intake.build_snapshot(issue, config)
     assert mapping["board"] == "right"
     assert snapshot["project_registry"][0]["id"] == "right"
+
+
+def test_task_evidence_is_canonical_across_different_source_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issue = "POL-146"
+    board = "factory"
+    board_dir = tmp_path / "kanban" / "boards" / board
+    board_dir.mkdir(parents=True)
+    db_path = board_dir / "kanban.db"
+    rows = [
+        ("task-b", f"[{issue}] second", "body-b", "running", "factory/pol-146-b", f"polaris-software-factory:{issue.lower()}:b"),
+        ("task-a", f"[{issue}] first", "body-a", "blocked", "factory/pol-146-a", f"polaris-software-factory:{issue.lower()}:a"),
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, status TEXT,
+                branch_name TEXT, idempotency_key TEXT
+            )"""
+        )
+        conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)", rows)
+
+    from hermes_cli import kanban_db as kb
+
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    # The intake adapter deliberately sees the opposite source order from the
+    # independent signer's SQLite query.
+    monkeypatch.setattr(kb, "connect", lambda *, board: Connection())
+    monkeypatch.setattr(
+        kb,
+        "list_tasks",
+        lambda _conn, *, include_archived: [
+            SimpleNamespace(
+                id=row[0], title=row[1], body=row[2], status=row[3],
+                branch_name=row[4], idempotency_key=row[5],
+            )
+            for row in reversed(rows)
+        ],
+    )
+
+    assert intake._task_rows(board, issue) == signer._task_rows(tmp_path, board, issue)
+    assert [row["id"] for row in intake._task_rows(board, issue)] == ["task-a", "task-b"]
 
 
 def test_http_acknowledges_after_durable_queue_before_admission(monkeypatch, tmp_path: Path) -> None:

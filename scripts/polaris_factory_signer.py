@@ -32,6 +32,11 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _canonical_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return evidence rows in a source-independent canonical order."""
+    return sorted(rows, key=canonical_bytes)
+
+
 def authority_policy(config: dict[str, Any]) -> dict[str, Any]:
     """Remove only the operational on/off switch from trusted policy."""
     return {key: value for key, value in config.items() if key != "enabled"}
@@ -160,11 +165,11 @@ def _linear_issue(identifier: str, token_path: Path | None) -> dict[str, Any]:
         "description": data["description"], "spec_finalized_at": data["createdAt"],
         "team_key": data["team"]["key"], "project_id": data["project"]["id"],
         "repository": repo_match.group(1).strip(),
-        "comments": [
+        "comments": _canonical_rows([
             {"id": row["id"], "body": row["body"], "created_at": row["createdAt"],
              "actor": {"id": (row.get("user") or {}).get("id"), "is_bot": False}}
             for row in data["comments"]["nodes"]
-        ],
+        ]),
     }
 
 
@@ -188,7 +193,10 @@ def _repo_state(repo: str, issue: str, token_path: Path | None) -> dict[str, Any
     pulls = [{"number": row["number"], "branch": row["head"]["ref"], "state": row["state"], "issue_identifier": issue}
              for row in gh(f"repos/{repo}/pulls?state=open&per_page=100")
              if needle in (row["title"] + " " + row["head"]["ref"]).casefold()]
-    return {"branches": branches, "pull_requests": pulls}
+    return {
+        "branches": _canonical_rows(branches),
+        "pull_requests": _canonical_rows(pulls),
+    }
 
 
 def _task_rows(home: Path, board: str, issue: str) -> list[dict[str, Any]]:
@@ -207,7 +215,7 @@ def _task_rows(home: Path, board: str, issue: str) -> list[dict[str, Any]]:
                          "branch_name": task["branch_name"], "body": task["body"],
                          "checkpoint_fingerprint": marker.group(0) if marker else None,
                          "metadata": {"linear_identifier": issue}})
-        return rows
+        return _canonical_rows(rows)
 
 
 def verify_evidence(
