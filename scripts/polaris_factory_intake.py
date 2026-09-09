@@ -44,6 +44,14 @@ SIGNER_COMMANDS = {
 }
 
 
+def _canonical_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return evidence rows in a source-independent canonical order."""
+    return sorted(
+        rows,
+        key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+    )
+
+
 def _atomic(path: Path, payload: dict[str, Any], mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = path.with_suffix(path.suffix + ".tmp")
@@ -94,11 +102,11 @@ def fetch_issue(identifier: str, engine: Any) -> dict[str, Any]:
         "description": data["description"], "spec_finalized_at": data["createdAt"],
         "team_key": data["team"]["key"], "project_id": data["project"]["id"],
         "repository": contract.repository_identity,
-        "comments": [
+        "comments": _canonical_rows([
             {"id": row["id"], "body": row["body"], "created_at": row["createdAt"],
              "actor": {"id": (row.get("user") or {}).get("id"), "is_bot": False}}
             for row in data["comments"]["nodes"]
-        ],
+        ]),
     }
 
 
@@ -121,7 +129,10 @@ def _repo_state(repo: str, issue: str) -> dict[str, Any]:
         for row in gh(f"repos/{repo}/pulls?state=open&per_page=100")
         if needle in (row["title"] + " " + row["head"]["ref"]).casefold()
     ]
-    return {"branches": branches, "pull_requests": pulls}
+    return {
+        "branches": _canonical_rows(branches),
+        "pull_requests": _canonical_rows(pulls),
+    }
 
 
 def _task_rows(board: str, issue: str) -> list[dict[str, Any]]:
@@ -140,7 +151,7 @@ def _task_rows(board: str, issue: str) -> list[dict[str, Any]]:
                          "branch_name": task.branch_name, "body": task.body,
                          "checkpoint_fingerprint": marker.group(0) if marker else None,
                          "metadata": {"linear_identifier": issue}})
-        return rows
+        return _canonical_rows(rows)
     finally:
         conn.close()
 
