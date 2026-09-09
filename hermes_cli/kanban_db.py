@@ -525,6 +525,8 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+POLARIS_ADMISSION_AUTHORITY = "polaris-execution-governor-v1"
+POLARIS_CANONICAL_BOARDS = frozenset({"polaris-ops", "acqlens", "surveyor", "apex"})
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
@@ -9939,10 +9941,17 @@ def dispatch_once(
     parallel behavior. See :func:`_dispatch_tick_lock` for the cross-process /
     cross-platform mechanics.
     """
+    resolved_board = board if board else get_current_board()
     configured_authority = str(
-        read_board_metadata(board).get("admission_authority") or ""
+        read_board_metadata(resolved_board).get("admission_authority") or ""
     ).strip()
-    if configured_authority and admission_authority != configured_authority:
+    governed_polaris_board = resolved_board in POLARIS_CANONICAL_BOARDS
+    authority_mismatch = (
+        (governed_polaris_board and configured_authority != POLARIS_ADMISSION_AUTHORITY)
+        or (configured_authority and admission_authority != configured_authority)
+        or (governed_polaris_board and admission_authority != POLARIS_ADMISSION_AUTHORITY)
+    )
+    if authority_mismatch:
         # Governed boards still run maintenance/reconciliation, but only the
         # configured authority may admit workers. This closes gateway,
         # dashboard, and direct-dispatch bypasses without disabling stale-
