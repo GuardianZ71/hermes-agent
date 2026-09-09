@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
+import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -31,6 +35,75 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
 def authority_policy(config: dict[str, Any]) -> dict[str, Any]:
     """Remove only the operational on/off switch from trusted policy."""
     return {key: value for key, value in config.items() if key != "enabled"}
+
+
+@contextmanager
+def _stable_readonly_database(path: Path):
+    """Read a descriptor-pinned DB snapshot without creating WAL sidecars."""
+    parent = path.parent.resolve(strict=True)
+    resolved = parent / path.name
+    wal = Path(f"{resolved}-wal")
+    shm = Path(f"{resolved}-shm")
+    if wal.exists() or shm.exists():
+        raise RuntimeError(f"authority database has active WAL sidecars: {resolved}")
+    before = os.stat(resolved, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"authority database is not a regular file: {resolved}")
+    identity = _database_identity(before)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(resolved, flags)
+    try:
+        if _database_identity(os.fstat(descriptor)) != identity:
+            raise RuntimeError(f"authority database changed during open: {resolved}")
+        if wal.exists() or shm.exists():
+            raise RuntimeError(f"authority database has active WAL sidecars: {resolved}")
+        with tempfile.TemporaryDirectory(prefix="polaris-authority-db-") as directory:
+            snapshot = Path(directory) / "snapshot.db"
+            output = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                offset = 0
+                while True:
+                    chunk = os.pread(descriptor, 1024 * 1024, offset)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(output, view)
+                        view = view[written:]
+                    offset += len(chunk)
+                os.fsync(output)
+            finally:
+                os.close(output)
+            _verify_database_identity(resolved, descriptor, identity, wal, shm)
+            uri = f"file:{urllib.parse.quote(str(snapshot), safe='/')}?mode=ro&immutable=1"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                yield conn
+            finally:
+                conn.close()
+            _verify_database_identity(resolved, descriptor, identity, wal, shm)
+    finally:
+        os.close(descriptor)
+
+
+def _database_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _verify_database_identity(
+    path: Path,
+    descriptor: int,
+    identity: tuple[int, int, int, int, int],
+    wal: Path,
+    shm: Path,
+) -> None:
+    try:
+        pathname = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(f"authority database changed during readback: {path}") from exc
+    if (_database_identity(os.fstat(descriptor)) != identity
+            or _database_identity(pathname) != identity or wal.exists() or shm.exists()):
+        raise RuntimeError(f"authority database changed during readback: {path}")
 
 
 def _read_secret(path: Path | None, label: str) -> str:
@@ -97,9 +170,9 @@ def _repo_state(repo: str, issue: str, token_path: Path | None) -> dict[str, Any
 
 
 def _task_rows(home: Path, board: str, issue: str) -> list[dict[str, Any]]:
-    conn = sqlite3.connect(f"file:{home / 'kanban' / 'boards' / board / 'kanban.db'}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
+    path = home / "kanban" / "boards" / board / "kanban.db"
+    with _stable_readonly_database(path) as conn:
+        conn.row_factory = sqlite3.Row
         rows = []
         prefix = f"polaris-software-factory:{issue.casefold()}:"
         for task in conn.execute("SELECT id,title,body,status,branch_name,idempotency_key FROM tasks"):
@@ -113,8 +186,6 @@ def _task_rows(home: Path, board: str, issue: str) -> list[dict[str, Any]]:
                          "checkpoint_fingerprint": marker.group(0) if marker else None,
                          "metadata": {"linear_identifier": issue}})
         return rows
-    finally:
-        conn.close()
 
 
 def verify_evidence(
@@ -148,11 +219,9 @@ def verify_evidence(
         if len(matches) != 1:
             raise ValueError("project authority found ambiguous mapping")
         mapping = matches[0]
-        conn = sqlite3.connect(f"file:{home / 'projects.db'}?mode=ro", uri=True); conn.row_factory = sqlite3.Row
-        try:
+        with _stable_readonly_database(home / "projects.db") as conn:
+            conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT id,board_slug,primary_path,archived FROM projects WHERE id=?", (mapping["project_id"],)).fetchone()
-        finally:
-            conn.close()
         if not row or row["archived"] or row["board_slug"] != mapping["board"] or row["primary_path"] != mapping["workspace"]:
             raise ValueError("project authority found registry/mapping drift")
         expected_projects = [{"id": mapping["project_id"], "repo": mapping["repo"], "archived": False}]

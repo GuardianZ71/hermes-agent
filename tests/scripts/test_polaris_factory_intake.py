@@ -5,6 +5,7 @@ import hmac
 import importlib.util
 import json
 import os
+import sqlite3
 import stat
 import sys
 import threading
@@ -188,3 +189,62 @@ def test_signer_runs_from_neutral_accessible_directory(monkeypatch: pytest.Monke
     monkeypatch.setattr(intake.subprocess, "run", fake_run)
     assert intake._sign("linear", {"schema_version": 1}) == "signature"
     assert captured["cwd"] == "/"
+
+
+def test_authority_readonly_database_avoids_wal_sidecars(tmp_path: Path) -> None:
+    db = tmp_path / "authority.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE evidence(value TEXT)")
+    conn.execute("INSERT INTO evidence VALUES ('current')")
+    conn.commit()
+    assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    conn.close()
+    assert not Path(f"{db}-wal").exists()
+    os.chmod(tmp_path, 0o555)
+    try:
+        with signer._stable_readonly_database(db) as readonly:
+            assert readonly.execute("SELECT value FROM evidence").fetchone()[0] == "current"
+    finally:
+        os.chmod(tmp_path, 0o755)
+    assert not Path(f"{db}-wal").exists()
+    assert not Path(f"{db}-shm").exists()
+
+
+def test_authority_readonly_database_rejects_active_wal_sidecar(tmp_path: Path) -> None:
+    db = tmp_path / "authority.db"
+    sqlite3.connect(db).close()
+    Path(f"{db}-wal").touch()
+    with pytest.raises(RuntimeError, match="active WAL sidecars"):
+        with signer._stable_readonly_database(db):
+            pass
+
+
+def test_authority_readonly_database_rejects_path_swap_during_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = tmp_path / "authority.db"
+    forged = tmp_path / "forged.db"
+    original = tmp_path / "original.db"
+    for path, value in ((db, "ORIGINAL"), (forged, "FORGED")):
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE evidence(value TEXT)")
+        conn.execute("INSERT INTO evidence VALUES (?)", (value,))
+        conn.commit()
+        conn.close()
+    real_open = os.open
+
+    def swapping_open(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if Path(path) == db:
+            os.replace(db, original)
+            os.replace(forged, db)
+            descriptor = real_open(path, flags, mode)
+            os.replace(db, forged)
+            os.replace(original, db)
+            return descriptor
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(signer.os, "open", swapping_open)
+    with pytest.raises(RuntimeError, match="changed during open"):
+        with signer._stable_readonly_database(db):
+            pass
+    assert sqlite3.connect(db).execute("SELECT value FROM evidence").fetchone()[0] == "ORIGINAL"
