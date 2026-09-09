@@ -799,6 +799,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
+    p_disp.add_argument(
+        "--exclude-task", action="append", default=[],
+        help="Do not admit this ready task during this pass (repeatable)",
+    )
+    p_disp.add_argument(
+        "--admit-only", action="store_true",
+        help="Admit only ready tasks named by --admit-task during this pass",
+    )
+    p_disp.add_argument(
+        "--admit-task", action="append", default=[],
+        help="Ready task eligible when --admit-only is set (repeatable)",
+    )
+    p_disp.add_argument(
+        "--max-in-progress", type=int, default=None,
+        help="Override the host-wide running-worker cap for this pass",
+    )
+    p_disp.add_argument(
+        "--max-in-progress-per-profile", type=int, default=None,
+        help="Override the fleet-wide per-profile worker cap for this pass",
+    )
     p_disp.add_argument("--json", action="store_true")
 
     # --- daemon (deprecated) ---
@@ -2743,6 +2763,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        cli_profile_cap = _coerce_positive_int(
+            getattr(args, "max_in_progress_per_profile", None)
+        )
+        if cli_profile_cap is not None:
+            max_in_progress_per_profile = cli_profile_cap
+        cli_host_cap = _coerce_positive_int(
+            getattr(args, "max_in_progress", None)
+        )
+        if cli_host_cap is not None:
+            max_in_progress = cli_host_cap
         # Memory-derived default when unset (OOF-30/OOF-77) — same
         # fallback the gateway-embedded dispatcher applies, so behaviour
         # matches regardless of which path runs the tick.
@@ -2767,6 +2797,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            excluded_task_ids=getattr(args, "exclude_task", None),
+            admitted_task_ids=(
+                getattr(args, "admit_task", None)
+                if getattr(args, "admit_only", False)
+                else None
+            ),
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2786,6 +2822,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_excluded": res.skipped_excluded,
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0

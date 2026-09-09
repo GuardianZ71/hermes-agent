@@ -862,6 +862,202 @@ class TestSharedBoardPaths:
 
 
 # ---------------------------------------------------------------------------
+# Respawn guard
+# ---------------------------------------------------------------------------
+
+
+def test_respawn_guard_active_pr_in_comment(kanban_home):
+    """A recent PR comment guards against an accidental duplicate worker."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "Opened https://github.com/example/repo/pull/42",
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_recent_success_bypassed_by_later_manual_promotion(kanban_home):
+    """Manual promotion is an explicit rerun for recent-success guards too."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="rerun", assignee="alice", initial_status="blocked"
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (task_id, now - 120, now - 60),
+        )
+        promoted, reason = kb.promote_task(
+            conn, task_id, actor="test", reason="operator requested rerun"
+        )
+        assert promoted, reason
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_respawn_guard_active_pr_bypassed_by_later_manual_promotion(kanban_home):
+    """The real promote API resumes a task after PR review."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="fix-review", assignee="alice", initial_status="blocked"
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/42", now - 60),
+        )
+        promoted, reason = kb.promote_task(
+            conn, task_id, actor="test", reason="review complete"
+        )
+        assert promoted, reason
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_respawn_guard_equal_timestamp_requeue_does_not_bypass(kanban_home):
+    """Second-resolution timestamp equality is not proof of later intent."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ambiguous-order", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/42", now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (task_id, now),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_requeue_before_pr_does_not_bypass(kanban_home):
+    """Only a requeue after the latest PR comment bypasses the guard."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="still-has-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted', ?)",
+            (task_id, now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/43", now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_active_pr_continuation_is_consumed_by_claim(kanban_home):
+    """An explicit continuation authorizes exactly one subsequent claim."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="one-shot", assignee="alice", initial_status="blocked"
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/44", now - 60),
+        )
+        promoted, reason = kb.promote_task(
+            conn, task_id, actor="test", reason="continue existing PR"
+        )
+        assert promoted, reason
+        assert kb.check_respawn_guard(conn, task_id) is None
+        assert kb.claim_task(conn, task_id) is not None
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL, current_run_id=NULL WHERE id=?",
+            (task_id,),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_generic_status_after_pr_does_not_authorize(kanban_home):
+    """A generic status event cannot permanently disable PR protection."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="status-only", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/45", now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'status', ?)",
+            (task_id, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_automatic_reclaim_after_pr_does_not_authorize(kanban_home):
+    """Stale-worker recovery is not intentional continuation authority."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="auto-reclaim", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/46", now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'reclaimed', ?, ?)",
+            (task_id, '{"manual": false}', now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_manual_reclaim_after_pr_does_not_authorize(kanban_home):
+    """Reclaim and explicit PR continuation remain separate operations."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="manual-reclaim", assignee="alice", initial_status="running"
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock='manual-test-lock' WHERE id=?",
+            (task_id,),
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/47", now - 60),
+        )
+        assert kb.reclaim_task(conn, task_id, reason="recover stopped worker")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'continuation_authorized'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_respawn_guard_explicit_continuation_event_after_pr_authorizes(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="manual-continuation", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/47", now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'continuation_authorized', ?, ?)",
+            (task_id, '{"reason": "continue existing PR"}', now - 10),
+        )
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+# ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------
 
