@@ -281,3 +281,36 @@ def test_canonical_polaris_board_without_authority_fails_closed(
     assert implicit_cli.skipped_excluded == [task_id]
 
 
+def test_canonical_db_path_override_cannot_disguise_board_as_default(
+    isolated_kanban_home_with_profiles, monkeypatch,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="surveyor", name="Surveyor")
+    db_path = kb.kanban_db_path(board="surveyor")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    with kb.connect_closing(db_path=db_path) as conn:
+        task_id = kb.create_task(conn, title="must-not-disguise", assignee="alpha")
+        explicit_default = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            board="default",
+            max_in_progress=5,
+            admitted_task_ids=[task_id],
+        )
+        implicit_default = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress=5,
+            admitted_task_ids=[task_id],
+        )
+
+    assert explicit_default.spawned == []
+    assert explicit_default.skipped_excluded == [task_id]
+    assert implicit_default.spawned == []
+    assert implicit_default.skipped_excluded == [task_id]
+
+
