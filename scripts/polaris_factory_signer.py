@@ -39,71 +39,93 @@ def authority_policy(config: dict[str, Any]) -> dict[str, Any]:
 
 @contextmanager
 def _stable_readonly_database(path: Path):
-    """Read a descriptor-pinned DB snapshot without creating WAL sidecars."""
+    """Read a descriptor-pinned snapshot of a live SQLite database and WAL."""
     parent = path.parent.resolve(strict=True)
     resolved = parent / path.name
     wal = Path(f"{resolved}-wal")
     shm = Path(f"{resolved}-shm")
-    if wal.exists() or shm.exists():
-        raise RuntimeError(f"authority database has active WAL sidecars: {resolved}")
-    before = os.stat(resolved, follow_symlinks=False)
-    if not stat.S_ISREG(before.st_mode):
-        raise RuntimeError(f"authority database is not a regular file: {resolved}")
-    identity = _database_identity(before)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(resolved, flags)
+    pinned: dict[Path, tuple[int, tuple[int, int, int, int, int]]] = {}
     try:
-        if _database_identity(os.fstat(descriptor)) != identity:
-            raise RuntimeError(f"authority database changed during open: {resolved}")
-        if wal.exists() or shm.exists():
-            raise RuntimeError(f"authority database has active WAL sidecars: {resolved}")
+        pinned[resolved] = _open_pinned_database_file(resolved)
+        try:
+            wal_before = os.stat(wal, follow_symlinks=False)
+        except FileNotFoundError:
+            wal_before = None
+        if wal_before is not None:
+            pinned[wal] = _open_pinned_database_file(wal, expected=wal_before)
+        elif shm.exists():
+            raise RuntimeError(f"authority database sidecars changed during open: {resolved}")
+
         with tempfile.TemporaryDirectory(prefix="polaris-authority-db-") as directory:
             snapshot = Path(directory) / "snapshot.db"
-            output = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                offset = 0
-                while True:
-                    chunk = os.pread(descriptor, 1024 * 1024, offset)
-                    if not chunk:
-                        break
-                    view = memoryview(chunk)
-                    while view:
-                        written = os.write(output, view)
-                        view = view[written:]
-                    offset += len(chunk)
-                os.fsync(output)
-            finally:
-                os.close(output)
-            _verify_database_identity(resolved, descriptor, identity, wal, shm)
-            uri = f"file:{urllib.parse.quote(str(snapshot), safe='/')}?mode=ro&immutable=1"
+            _copy_pinned_file(pinned[resolved][0], snapshot)
+            if wal in pinned:
+                _copy_pinned_file(pinned[wal][0], Path(f"{snapshot}-wal"))
+            _verify_pinned_database(resolved, wal, shm, pinned)
+            uri = f"file:{urllib.parse.quote(str(snapshot), safe='/')}?mode=rw"
             conn = sqlite3.connect(uri, uri=True)
             try:
                 yield conn
             finally:
                 conn.close()
-            _verify_database_identity(resolved, descriptor, identity, wal, shm)
+            _verify_pinned_database(resolved, wal, shm, pinned)
     finally:
-        os.close(descriptor)
+        for descriptor, _identity in pinned.values():
+            os.close(descriptor)
 
 
 def _database_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
-def _verify_database_identity(
+def _open_pinned_database_file(
+    path: Path, *, expected: os.stat_result | None = None,
+) -> tuple[int, tuple[int, int, int, int, int]]:
+    before = expected or os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"authority database path is not a regular file: {path}")
+    identity = _database_identity(before)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    if _database_identity(os.fstat(descriptor)) != identity:
+        os.close(descriptor)
+        raise RuntimeError(f"authority database changed during open: {path}")
+    return descriptor, identity
+
+
+def _copy_pinned_file(descriptor: int, destination: Path) -> None:
+    output = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        offset = 0
+        while True:
+            chunk = os.pread(descriptor, 1024 * 1024, offset)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output, view)
+                view = view[written:]
+            offset += len(chunk)
+        os.fsync(output)
+    finally:
+        os.close(output)
+
+
+def _verify_pinned_database(
     path: Path,
-    descriptor: int,
-    identity: tuple[int, int, int, int, int],
     wal: Path,
     shm: Path,
+    pinned: dict[Path, tuple[int, tuple[int, int, int, int, int]]],
 ) -> None:
-    try:
-        pathname = os.stat(path, follow_symlinks=False)
-    except OSError as exc:
-        raise RuntimeError(f"authority database changed during readback: {path}") from exc
-    if (_database_identity(os.fstat(descriptor)) != identity
-            or _database_identity(pathname) != identity or wal.exists() or shm.exists()):
-        raise RuntimeError(f"authority database changed during readback: {path}")
+    for pathname, (descriptor, identity) in pinned.items():
+        try:
+            current = os.stat(pathname, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(f"authority database changed during readback: {path}") from exc
+        if _database_identity(os.fstat(descriptor)) != identity or _database_identity(current) != identity:
+            raise RuntimeError(f"authority database changed during readback: {path}")
+    if (wal in pinned) != wal.exists() or (wal not in pinned and shm.exists()):
+        raise RuntimeError(f"authority database sidecars changed during readback: {path}")
 
 
 def _read_secret(path: Path | None, label: str) -> str:

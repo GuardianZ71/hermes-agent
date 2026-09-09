@@ -210,13 +210,19 @@ def test_authority_readonly_database_avoids_wal_sidecars(tmp_path: Path) -> None
     assert not Path(f"{db}-shm").exists()
 
 
-def test_authority_readonly_database_rejects_active_wal_sidecar(tmp_path: Path) -> None:
+def test_authority_readonly_database_copies_active_wal_snapshot(tmp_path: Path) -> None:
     db = tmp_path / "authority.db"
-    sqlite3.connect(db).close()
-    Path(f"{db}-wal").touch()
-    with pytest.raises(RuntimeError, match="active WAL sidecars"):
-        with signer._stable_readonly_database(db):
-            pass
+    writer = sqlite3.connect(db)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("CREATE TABLE evidence(value TEXT)")
+    writer.execute("INSERT INTO evidence VALUES ('committed-in-wal')")
+    writer.commit()
+    assert Path(f"{db}-wal").exists()
+    try:
+        with signer._stable_readonly_database(db) as readonly:
+            assert readonly.execute("SELECT value FROM evidence").fetchone()[0] == "committed-in-wal"
+    finally:
+        writer.close()
 
 
 def test_authority_readonly_database_rejects_path_swap_during_open(
