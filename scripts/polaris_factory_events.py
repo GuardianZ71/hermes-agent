@@ -29,7 +29,7 @@ DEFAULT_RECONCILE_SECONDS = 60
 
 def _load(path: Path) -> dict:
     try:
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
@@ -38,7 +38,7 @@ def _load(path: Path) -> dict:
 def _atomic_write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+    temp.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     os.replace(temp, path)
 
 
