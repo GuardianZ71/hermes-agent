@@ -70,6 +70,7 @@ new locking.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -86,6 +87,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -5404,7 +5406,12 @@ _FACTORY_KEY_RE = re.compile(r"^polaris-software-factory:[^:]+:outcome$")
 _FACTORY_INTAKE_MARKER_RE = re.compile(
     r"POLARIS_FACTORY_CHECKPOINT_V1 sha256:[0-9a-f]{64}"
 )
-_FACTORY_COMPLETION_TOKEN = object()
+_FACTORY_AUTHORITY_FIELDS = {
+    "schema_version", "source_kind", "issue_identifier", "config", "source_state",
+    "actions_digest", "issued_at", "expires_at", "nonce",
+}
+_FACTORY_COMPLETION_AUTHORITIES = {"linear", "github", "ci", "deployment", "live"}
+_FACTORY_AUTHORITY_KEYS_PATH = Path.home() / ".hermes/factory/authority-public-keys.json"
 
 
 def _is_factory_outcome_row(row: sqlite3.Row | None) -> bool:
@@ -5425,6 +5432,129 @@ def _factory_delivery_checkpoint_marker(checkpoint: Mapping[str, Any]) -> str:
         "POLARIS_FACTORY_CHECKPOINT_V1 sha256:"
         + hashlib.sha256(encoded.encode()).hexdigest()
     )
+
+
+def _validate_factory_authority_envelope(
+    task_id: str,
+    idempotency_key: str,
+    metadata: Optional[dict],
+    authority_envelope: Optional[Mapping[str, Any]],
+    actions: Optional[Iterable[Mapping[str, Any]]],
+) -> None:
+    """Verify the short-lived multi-authority completion grant at mutation time."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as exc:
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority verification requires cryptography"
+        ) from exc
+    if not isinstance(authority_envelope, Mapping):
+        raise FactoryCompletionRequiredError(
+            "factory outcome completion requires a signed canonical reconciliation"
+        )
+    envelope = dict(authority_envelope)
+    payload = envelope.get("payload")
+    signatures = envelope.get("signatures")
+    if (
+        set(envelope) != {"payload", "signatures"}
+        or not isinstance(payload, Mapping)
+        or set(payload) != _FACTORY_AUTHORITY_FIELDS
+        or not isinstance(signatures, Mapping)
+        or set(signatures) != _FACTORY_COMPLETION_AUTHORITIES
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority envelope is not canonical"
+        )
+    action_list = [dict(action) for action in actions or ()]
+    digest = hashlib.sha256(
+        json.dumps(action_list, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    issue_identifier = str(payload.get("issue_identifier") or "")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("source_kind") != "completion"
+        or payload.get("actions_digest") != digest
+        or idempotency_key != f"{_FACTORY_OWNER}:{issue_identifier.casefold()}:outcome"
+        or not issue_identifier
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority does not bind this outcome and action list"
+        )
+    matching = [
+        action for action in action_list
+        if action.get("kind") == "kanban.complete_outcome"
+    ]
+    if (
+        len(action_list) != 1
+        or len(matching) != 1
+        or matching[0].get("task_id") != task_id
+        or matching[0].get("expected_idempotency_key") != idempotency_key
+        or matching[0].get("completion_evidence") != metadata
+    ):
+        raise FactoryCompletionEvidenceError(
+            "signed factory action does not authorize this exact completion mutation"
+        )
+    try:
+        issued = datetime.fromisoformat(
+            str(payload.get("issued_at") or "").replace("Z", "+00:00")
+        )
+        expires = datetime.fromisoformat(
+            str(payload.get("expires_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority timestamps are invalid"
+        ) from exc
+    now = datetime.now(timezone.utc)
+    if (
+        issued.tzinfo is None
+        or expires.tzinfo is None
+        or issued > now
+        or expires < now
+        or (expires - issued).total_seconds() > 300
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority is stale, premature, or overlong"
+        )
+    registry_path = _FACTORY_AUTHORITY_KEYS_PATH
+    try:
+        if registry_path.stat().st_mode & 0o022 or registry_path.parent.stat().st_mode & 0o022:
+            raise FactoryCompletionEvidenceError(
+                "factory authority trust registry must not be group/world writable"
+            )
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        authorities = registry["authorities"]
+        if registry.get("schema_version") != 1 or not isinstance(authorities, dict):
+            raise ValueError
+    except FactoryCompletionEvidenceError:
+        raise
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise FactoryCompletionEvidenceError(
+            "factory authority trust registry is unavailable or malformed"
+        ) from exc
+    payload_bytes = json.dumps(
+        dict(payload), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    key_material: list[bytes] = []
+    for source in sorted(_FACTORY_COMPLETION_AUTHORITIES):
+        try:
+            entry = authorities[source]
+            if "completion" not in entry["source_kinds"]:
+                raise ValueError
+            public_bytes = base64.b64decode(str(entry["public_key"]), validate=True)
+            signature = base64.b64decode(str(signatures[source]), validate=True)
+            if len(public_bytes) != 32:
+                raise ValueError
+            Ed25519PublicKey.from_public_bytes(public_bytes).verify(signature, payload_bytes)
+        except Exception as exc:
+            raise FactoryCompletionEvidenceError(
+                f"invalid {source} factory completion authority"
+            ) from exc
+        key_material.append(public_bytes)
+    if len(set(key_material)) != len(key_material):
+        raise FactoryCompletionEvidenceError(
+            "factory completion requires distinct authority keys"
+        )
 
 
 def _validate_factory_completion_evidence(
@@ -5575,7 +5705,8 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
-    _factory_completion_token: object | None = None,
+    factory_authority_envelope: Optional[Mapping[str, Any]] = None,
+    factory_actions: Optional[Iterable[Mapping[str, Any]]] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5613,26 +5744,29 @@ def complete_task(
         "SELECT body, created_by, idempotency_key FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
-    if (
-        _is_factory_outcome_row(factory_row)
-        and _factory_completion_token is not _FACTORY_COMPLETION_TOKEN
-    ):
-        with write_txn(conn):
-            _append_event(
-                conn,
+    if _is_factory_outcome_row(factory_row):
+        try:
+            _validate_factory_authority_envelope(
                 task_id,
-                "completion_blocked_factory",
-                {
-                    "reason": "canonical_factory_reconciliation_required",
-                    "summary_preview": (summary or result or "").strip().splitlines()[0][:200],
-                },
-                run_id=_current_run_id(conn, task_id),
+                str(factory_row["idempotency_key"] or ""),
+                metadata,
+                factory_authority_envelope,
+                factory_actions,
             )
-        raise FactoryCompletionRequiredError(
-            "factory outcome completion is reserved for canonical factory reconciliation "
-            "after exact-head review, hosted CI, merge, deployment, live acceptance, "
-            "and healthy production readback"
-        )
+            _validate_factory_completion_evidence(conn, task_id, metadata)
+        except (FactoryCompletionRequiredError, FactoryCompletionEvidenceError):
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_factory",
+                    {
+                        "reason": "canonical_factory_reconciliation_required",
+                        "summary_preview": (summary or result or "").strip().splitlines()[0][:200],
+                    },
+                    run_id=_current_run_id(conn, task_id),
+                )
+            raise
 
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
@@ -5841,6 +5975,8 @@ def complete_factory_outcome(
     result: Optional[str] = None,
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
+    authority_envelope: Optional[Mapping[str, Any]] = None,
+    actions: Optional[Iterable[Mapping[str, Any]]] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Complete a factory outcome authorized by the signed native reconciler.
@@ -5849,6 +5985,18 @@ def complete_factory_outcome(
     factory-owned outcomes. The native adapter calls this function only after it
     has recomputed and signature-verified ``kanban.complete_outcome``.
     """
+    row = conn.execute(
+        "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise FactoryCompletionEvidenceError("factory outcome task does not exist")
+    _validate_factory_authority_envelope(
+        task_id,
+        str(row["idempotency_key"] or ""),
+        metadata,
+        authority_envelope,
+        actions,
+    )
     row = _validate_factory_completion_evidence(conn, task_id, metadata)
     expected_run_id = (
         int(row["current_run_id"]) if row["current_run_id"] is not None else None
@@ -5873,7 +6021,8 @@ def complete_factory_outcome(
         metadata=metadata,
         expected_run_id=expected_run_id,
         fire_lifecycle_hook=fire_lifecycle_hook,
-        _factory_completion_token=_FACTORY_COMPLETION_TOKEN,
+        factory_authority_envelope=authority_envelope,
+        factory_actions=actions,
     )
     if completed and termination is not None:
         with write_txn(conn):
