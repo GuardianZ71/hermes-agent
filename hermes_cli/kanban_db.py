@@ -5411,7 +5411,13 @@ _FACTORY_AUTHORITY_FIELDS = {
     "actions_digest", "issued_at", "expires_at", "nonce",
 }
 _FACTORY_COMPLETION_AUTHORITIES = {"linear", "github", "ci", "deployment", "live"}
-_FACTORY_AUTHORITY_KEYS_PATH = Path.home() / ".hermes/factory/authority-public-keys.json"
+_FACTORY_AUTHORITY_KEYS_PATH = (
+    Path("/Library/Hermes/factory-authority-public-keys.json")
+    if sys.platform == "darwin"
+    else Path("C:/ProgramData/Hermes/factory-authority-public-keys.json")
+    if sys.platform == "win32"
+    else Path("/etc/hermes/factory-authority-public-keys.json")
+)
 
 
 def _is_factory_outcome_row(row: sqlite3.Row | None) -> bool:
@@ -5432,6 +5438,37 @@ def _factory_delivery_checkpoint_marker(checkpoint: Mapping[str, Any]) -> str:
         "POLARIS_FACTORY_CHECKPOINT_V1 sha256:"
         + hashlib.sha256(encoded.encode()).hexdigest()
     )
+
+
+def _validate_factory_trust_path(path: Path) -> None:
+    """Require a fixed, root-owned trust path with no replaceable ancestry."""
+    if not path.is_absolute():
+        raise FactoryCompletionEvidenceError(
+            "factory authority trust registry path must be absolute"
+        )
+    current = path
+    while True:
+        try:
+            if current.is_symlink():
+                raise FactoryCompletionEvidenceError(
+                    "factory authority trust registry ancestry must not contain symlinks"
+                )
+            info = current.stat()
+        except OSError as exc:
+            raise FactoryCompletionEvidenceError(
+                "factory authority trust registry is unavailable"
+            ) from exc
+        if os.name == "posix" and getattr(info, "st_uid", None) != 0:
+            raise FactoryCompletionEvidenceError(
+                "factory authority trust registry ancestry must be root-owned"
+            )
+        if info.st_mode & 0o022:
+            raise FactoryCompletionEvidenceError(
+                "factory authority trust registry ancestry must not be group/world writable"
+            )
+        if current.parent == current:
+            break
+        current = current.parent
 
 
 def _validate_factory_authority_envelope(
@@ -5517,11 +5554,8 @@ def _validate_factory_authority_envelope(
             "factory completion authority is stale, premature, or overlong"
         )
     registry_path = _FACTORY_AUTHORITY_KEYS_PATH
+    _validate_factory_trust_path(registry_path)
     try:
-        if registry_path.stat().st_mode & 0o022 or registry_path.parent.stat().st_mode & 0o022:
-            raise FactoryCompletionEvidenceError(
-                "factory authority trust registry must not be group/world writable"
-            )
         registry = json.loads(registry_path.read_text(encoding="utf-8"))
         authorities = registry["authorities"]
         if registry.get("schema_version") != 1 or not isinstance(authorities, dict):
@@ -6002,12 +6036,36 @@ def complete_factory_outcome(
         int(row["current_run_id"]) if row["current_run_id"] is not None else None
     )
     worker_pid = int(row["worker_pid"]) if row["worker_pid"] is not None else None
+    if worker_pid == os.getpid():
+        raise FactoryCompletionEvidenceError(
+            "canonical factory reconciliation cannot run inside the active worker"
+        )
+    with write_txn(conn):
+        reserved = conn.execute(
+            "UPDATE tasks SET status = 'review' "
+            "WHERE id = ? AND status = ? AND current_run_id IS ? "
+            "AND worker_pid IS ? AND claim_lock IS ?",
+            (
+                task_id,
+                row["status"],
+                row["current_run_id"],
+                row["worker_pid"],
+                row["claim_lock"],
+            ),
+        )
+        if reserved.rowcount != 1:
+            raise FactoryCompletionEvidenceError(
+                "factory outcome changed while completion was being reserved"
+            )
+        _append_event(
+            conn,
+            task_id,
+            "factory_completion_reserved",
+            {"status": "review"},
+            run_id=expected_run_id,
+        )
     termination: Optional[dict[str, Any]] = None
     if worker_pid is not None:
-        if worker_pid == os.getpid():
-            raise FactoryCompletionEvidenceError(
-                "canonical factory reconciliation cannot run inside the active worker"
-            )
         termination = _terminate_reclaimed_worker(worker_pid, row["claim_lock"])
         if _worker_survived_termination(termination):
             raise FactoryCompletionEvidenceError(

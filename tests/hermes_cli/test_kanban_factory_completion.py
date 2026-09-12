@@ -6,6 +6,7 @@ import base64
 import hashlib
 import inspect
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,6 +28,7 @@ def kanban_home(tmp_path, monkeypatch):
         "_FACTORY_AUTHORITY_KEYS_PATH",
         home / "factory" / "authority-public-keys.json",
     )
+    monkeypatch.setattr(kb, "_validate_factory_trust_path", lambda _path: None)
     kb.init_db()
     return home
 
@@ -203,3 +205,60 @@ def test_non_factory_completion_is_unchanged(kanban_home):
         task_id = kb.create_task(conn, title="Ordinary task", initial_status="running")
         assert kb.complete_task(conn, task_id, result="done")
         assert kb.get_task(conn, task_id).status == "done"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check")
+def test_factory_trust_registry_rejects_user_owned_ancestry(tmp_path):
+    registry = tmp_path / "factory" / "authority-public-keys.json"
+    registry.parent.mkdir(mode=0o700)
+    registry.write_text("{}", encoding="utf-8")
+    registry.chmod(0o400)
+    with pytest.raises(
+        kb.FactoryCompletionEvidenceError,
+        match="root-owned",
+    ):
+        kb._validate_factory_trust_path(registry)
+
+
+def test_factory_completion_reservation_rejects_racing_claim(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        task_id = _factory_task(conn)
+        evidence = _completion_evidence(task_id)
+        envelope, actions = _signed_completion_authority(kanban_home, task_id, evidence)
+        marker = kb._factory_delivery_checkpoint_marker(evidence["delivery_checkpoint"])
+        kb.add_comment(conn, task_id, "polaris-software-factory", marker)
+
+        original_validate = kb._validate_factory_completion_evidence
+        raced = False
+
+        def validate_then_claim(check_conn, check_task_id, metadata):
+            nonlocal raced
+            row = original_validate(check_conn, check_task_id, metadata)
+            if not raced:
+                raced = True
+                with kb.connect() as racing_conn:
+                    assert kb.claim_task(
+                        racing_conn, check_task_id, claimer="racing-worker"
+                    )
+            return row
+
+        monkeypatch.setattr(
+            kb, "_validate_factory_completion_evidence", validate_then_claim
+        )
+        with pytest.raises(
+            kb.FactoryCompletionEvidenceError,
+            match="changed while completion was being reserved",
+        ):
+            kb.complete_factory_outcome(
+                conn,
+                task_id,
+                metadata=evidence,
+                authority_envelope=envelope,
+                actions=actions,
+            )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id is not None
