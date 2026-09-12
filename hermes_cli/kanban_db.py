@@ -70,6 +70,7 @@ new locking.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -86,6 +87,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -5391,6 +5393,346 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class FactoryCompletionRequiredError(ValueError):
+    """Raised when an ordinary completion targets a Polaris factory outcome."""
+
+
+class FactoryCompletionEvidenceError(ValueError):
+    """Raised when canonical factory delivery evidence is incomplete or inconsistent."""
+
+
+_FACTORY_OWNER = "polaris-software-factory"
+_FACTORY_KEY_RE = re.compile(r"^polaris-software-factory:[^:]+:outcome$")
+_FACTORY_INTAKE_MARKER_RE = re.compile(
+    r"POLARIS_FACTORY_CHECKPOINT_V1 sha256:[0-9a-f]{64}"
+)
+_FACTORY_AUTHORITY_FIELDS = {
+    "schema_version", "source_kind", "issue_identifier", "config", "source_state",
+    "actions_digest", "issued_at", "expires_at", "nonce",
+}
+_FACTORY_COMPLETION_AUTHORITIES = {"linear", "github", "ci", "deployment", "live"}
+_FACTORY_AUTHORITY_KEYS_PATH = (
+    Path("/Library/Hermes/factory-authority-public-keys.json")
+    if sys.platform == "darwin"
+    else Path("C:/ProgramData/Hermes/factory-authority-public-keys.json")
+    if sys.platform == "win32"
+    else Path("/etc/hermes/factory-authority-public-keys.json")
+)
+
+
+def _is_factory_outcome_row(row: sqlite3.Row | None) -> bool:
+    """Fail closed when either durable factory ownership signal is present."""
+    if row is None:
+        return False
+    key = str(row["idempotency_key"] or "")
+    body = str(row["body"] or "")
+    return bool(
+        key.startswith(f"{_FACTORY_OWNER}:")
+        or _FACTORY_INTAKE_MARKER_RE.search(body)
+    )
+
+
+def _factory_delivery_checkpoint_marker(checkpoint: Mapping[str, Any]) -> str:
+    encoded = json.dumps(dict(checkpoint), sort_keys=True, separators=(",", ":"))
+    return (
+        "POLARIS_FACTORY_CHECKPOINT_V1 sha256:"
+        + hashlib.sha256(encoded.encode()).hexdigest()
+    )
+
+
+def _validate_factory_trust_path(path: Path) -> None:
+    """Require a fixed, root-owned trust path with no replaceable ancestry."""
+    if not path.is_absolute():
+        raise FactoryCompletionEvidenceError(
+            "factory authority trust registry path must be absolute"
+        )
+    if os.name != "posix":
+        raise FactoryCompletionEvidenceError(
+            "factory completion trust registry is not supported on this platform"
+        )
+    current = path
+    while True:
+        try:
+            if current.is_symlink():
+                raise FactoryCompletionEvidenceError(
+                    "factory authority trust registry ancestry must not contain symlinks"
+                )
+            info = current.stat()
+        except OSError as exc:
+            raise FactoryCompletionEvidenceError(
+                "factory authority trust registry is unavailable"
+            ) from exc
+        if os.name == "posix" and getattr(info, "st_uid", None) != 0:
+            raise FactoryCompletionEvidenceError(
+                "factory authority trust registry ancestry must be root-owned"
+            )
+        if info.st_mode & 0o022:
+            raise FactoryCompletionEvidenceError(
+                "factory authority trust registry ancestry must not be group/world writable"
+            )
+        if current.parent == current:
+            break
+        current = current.parent
+
+
+def _validate_factory_authority_envelope(
+    task_id: str,
+    idempotency_key: str,
+    metadata: Optional[dict],
+    authority_envelope: Optional[Mapping[str, Any]],
+    actions: Optional[Iterable[Mapping[str, Any]]],
+) -> None:
+    """Verify the short-lived multi-authority completion grant at mutation time."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as exc:
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority verification requires cryptography"
+        ) from exc
+    if not isinstance(authority_envelope, Mapping):
+        raise FactoryCompletionRequiredError(
+            "factory outcome completion requires a signed canonical reconciliation"
+        )
+    envelope = dict(authority_envelope)
+    payload = envelope.get("payload")
+    signatures = envelope.get("signatures")
+    if (
+        set(envelope) != {"payload", "signatures"}
+        or not isinstance(payload, Mapping)
+        or set(payload) != _FACTORY_AUTHORITY_FIELDS
+        or not isinstance(signatures, Mapping)
+        or set(signatures) != _FACTORY_COMPLETION_AUTHORITIES
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority envelope is not canonical"
+        )
+    action_list = [dict(action) for action in actions or ()]
+    digest = hashlib.sha256(
+        json.dumps(action_list, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    issue_identifier = str(payload.get("issue_identifier") or "")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("source_kind") != "completion"
+        or payload.get("actions_digest") != digest
+        or idempotency_key != f"{_FACTORY_OWNER}:{issue_identifier.casefold()}:outcome"
+        or not issue_identifier
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority does not bind this outcome and action list"
+        )
+    matching = [
+        action for action in action_list
+        if action.get("kind") == "kanban.complete_outcome"
+    ]
+    if (
+        len(action_list) != 1
+        or len(matching) != 1
+        or matching[0].get("task_id") != task_id
+        or matching[0].get("expected_idempotency_key") != idempotency_key
+        or matching[0].get("completion_evidence") != metadata
+    ):
+        raise FactoryCompletionEvidenceError(
+            "signed factory action does not authorize this exact completion mutation"
+        )
+    try:
+        issued = datetime.fromisoformat(
+            str(payload.get("issued_at") or "").replace("Z", "+00:00")
+        )
+        expires = datetime.fromisoformat(
+            str(payload.get("expires_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority timestamps are invalid"
+        ) from exc
+    now = datetime.now(timezone.utc)
+    if (
+        issued.tzinfo is None
+        or expires.tzinfo is None
+        or issued > now
+        or expires < now
+        or (expires - issued).total_seconds() > 300
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory completion authority is stale, premature, or overlong"
+        )
+    registry_path = _FACTORY_AUTHORITY_KEYS_PATH
+    _validate_factory_trust_path(registry_path)
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        authorities = registry["authorities"]
+        if registry.get("schema_version") != 1 or not isinstance(authorities, dict):
+            raise ValueError
+    except FactoryCompletionEvidenceError:
+        raise
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise FactoryCompletionEvidenceError(
+            "factory authority trust registry is unavailable or malformed"
+        ) from exc
+    payload_bytes = json.dumps(
+        dict(payload), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    key_material: list[bytes] = []
+    for source in sorted(_FACTORY_COMPLETION_AUTHORITIES):
+        try:
+            entry = authorities[source]
+            if "completion" not in entry["source_kinds"]:
+                raise ValueError
+            public_bytes = base64.b64decode(str(entry["public_key"]), validate=True)
+            signature = base64.b64decode(str(signatures[source]), validate=True)
+            if len(public_bytes) != 32:
+                raise ValueError
+            Ed25519PublicKey.from_public_bytes(public_bytes).verify(signature, payload_bytes)
+        except Exception as exc:
+            raise FactoryCompletionEvidenceError(
+                f"invalid {source} factory completion authority"
+            ) from exc
+        key_material.append(public_bytes)
+    if len(set(key_material)) != len(key_material):
+        raise FactoryCompletionEvidenceError(
+            "factory completion requires distinct authority keys"
+        )
+
+
+def _validate_factory_completion_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> sqlite3.Row:
+    """Validate the reducer's persisted review→CI→merge→deploy→live chain.
+
+    Signature and authority-envelope verification remains the responsibility of
+    the Polaris native adapter. This boundary independently checks that the
+    exact canonical evidence it authorized is internally linked before allowing
+    the otherwise-forbidden terminal transition.
+    """
+    row = conn.execute(
+        "SELECT id, body, created_by, idempotency_key, branch_name, "
+        "status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not _is_factory_outcome_row(row):
+        raise FactoryCompletionEvidenceError(
+            "canonical factory completion requires a factory-owned outcome task"
+        )
+    key = str(row["idempotency_key"] or "")
+    if (
+        row["created_by"] != _FACTORY_OWNER
+        or not _FACTORY_KEY_RE.fullmatch(key)
+        or not _FACTORY_INTAKE_MARKER_RE.search(str(row["body"] or ""))
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory outcome identity or immutable intake checkpoint is invalid"
+        )
+    if not isinstance(metadata, dict):
+        raise FactoryCompletionEvidenceError(
+            "canonical factory completion requires delivery evidence"
+        )
+    required = {
+        "delivery_checkpoint", "hosted_ci", "merge", "deployment", "live_acceptance",
+    }
+    if set(metadata) != required or any(
+        not isinstance(metadata.get(name), Mapping) for name in required
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory delivery evidence must use the canonical schema"
+        )
+    checkpoint = metadata["delivery_checkpoint"]
+    checkpoint_fields = {
+        "schema_version", "issue_identifier", "outcome_idempotency_key", "task_id",
+        "repo", "branch", "pr_number", "reviewer_id", "reviewed_head_sha",
+        "review_evidence_digest", "deployment_mapping",
+    }
+    if set(checkpoint) != checkpoint_fields:
+        raise FactoryCompletionEvidenceError(
+            "factory delivery checkpoint must use the canonical schema"
+        )
+    head = str(checkpoint.get("reviewed_head_sha") or "")
+    review_digest = str(checkpoint.get("review_evidence_digest") or "")
+    issue_identifier = str(checkpoint.get("issue_identifier") or "")
+    pr_number = checkpoint.get("pr_number")
+    if (
+        checkpoint.get("schema_version") != 1
+        or key != f"{_FACTORY_OWNER}:{issue_identifier.casefold()}:outcome"
+        or checkpoint.get("task_id") != task_id
+        or checkpoint.get("outcome_idempotency_key") != key
+        or checkpoint.get("branch") != row["branch_name"]
+        or not str(checkpoint.get("repo") or "").strip()
+        or not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or pr_number <= 0
+        or not str(checkpoint.get("reviewer_id") or "").strip()
+        or not head
+        or not re.fullmatch(r"[0-9a-f]{64}", review_digest)
+        or not str(checkpoint.get("deployment_mapping") or "").strip()
+    ):
+        raise FactoryCompletionEvidenceError(
+            "factory delivery checkpoint contradicts the owned outcome identity"
+        )
+    marker = _factory_delivery_checkpoint_marker(checkpoint)
+    persisted = conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
+        "AND instr(body, ?) > 0 LIMIT 1",
+        (task_id, _FACTORY_OWNER, marker),
+    ).fetchone()
+    if persisted is None:
+        raise FactoryCompletionEvidenceError(
+            "factory outcome lacks the persisted exact-head delivery checkpoint"
+        )
+
+    ci, merge = metadata["hosted_ci"], metadata["merge"]
+    deployment, live = metadata["deployment"], metadata["live_acceptance"]
+    merge_sha = str(merge.get("merge_sha") or "")
+    if (
+        ci.get("status") != "success"
+        or ci.get("head_sha") != head
+        or not str(ci.get("run_id") or "").strip()
+    ):
+        raise FactoryCompletionEvidenceError(
+            "successful hosted CI on the reviewed head is required"
+        )
+    if (
+        merge.get("status") != "merged"
+        or merge.get("pr_number") != pr_number
+        or merge.get("head_sha") != head
+        or not merge_sha
+    ):
+        raise FactoryCompletionEvidenceError(
+            "merge evidence must bind the reviewed head to the merge SHA"
+        )
+    deployment_id = str(deployment.get("deployment_id") or "")
+    if (
+        deployment.get("status") != "success"
+        or deployment.get("deployment_mapping") != checkpoint["deployment_mapping"]
+        or deployment.get("source_sha") != merge_sha
+        or not deployment_id
+    ):
+        raise FactoryCompletionEvidenceError(
+            "successful mapped deployment of the merge SHA is required"
+        )
+    checked_at = str(live.get("checked_at") or "")
+    try:
+        from datetime import datetime
+
+        datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise FactoryCompletionEvidenceError(
+            "live acceptance requires a parseable checked_at timestamp"
+        ) from None
+    if (
+        live.get("status") != "passed"
+        or live.get("deployment_id") != deployment_id
+        or live.get("production_readback") != "healthy"
+        or not str(live.get("user_path") or "").strip()
+        or not checked_at
+    ):
+        raise FactoryCompletionEvidenceError(
+            "passed live acceptance and healthy production readback are required"
+        )
+    return row
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5401,6 +5743,9 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    factory_authority_envelope: Optional[Mapping[str, Any]] = None,
+    factory_actions: Optional[Iterable[Mapping[str, Any]]] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5434,6 +5779,44 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    factory_row = conn.execute(
+        "SELECT body, created_by, idempotency_key, status, current_run_id, claim_lock "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if _is_factory_outcome_row(factory_row):
+        try:
+            if (
+                not expected_claim_lock
+                or not expected_claim_lock.startswith("factory-completion:")
+                or factory_row["status"] != "running"
+                or factory_row["claim_lock"] != expected_claim_lock
+            ):
+                raise FactoryCompletionRequiredError(
+                    "factory outcome completion requires an atomic reservation"
+                )
+            _validate_factory_authority_envelope(
+                task_id,
+                str(factory_row["idempotency_key"] or ""),
+                metadata,
+                factory_authority_envelope,
+                factory_actions,
+            )
+            _validate_factory_completion_evidence(conn, task_id, metadata)
+        except (FactoryCompletionRequiredError, FactoryCompletionEvidenceError):
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_factory",
+                    {
+                        "reason": "canonical_factory_reconciliation_required",
+                        "summary_preview": (summary or result or "").strip()[:200],
+                    },
+                    run_id=_current_run_id(conn, task_id),
+                )
+            raise
+
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -5481,7 +5864,26 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
-        if expected_run_id is None:
+        if expected_claim_lock is not None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id IS ?
+                   AND claim_lock = ?
+                """,
+                (result, now, task_id, expected_run_id, expected_claim_lock),
+            )
+        elif expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5632,6 +6034,102 @@ def complete_task(
             summary=(summary if summary is not None else result),
         )
     return True
+
+
+def complete_factory_outcome(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    authority_envelope: Optional[Mapping[str, Any]] = None,
+    actions: Optional[Iterable[Mapping[str, Any]]] = None,
+    fire_lifecycle_hook: bool = True,
+) -> bool:
+    """Complete a factory outcome authorized by the signed native reconciler.
+
+    Ordinary workers and reviewers must use :func:`complete_task`, which rejects
+    factory-owned outcomes. The native adapter calls this function only after it
+    has recomputed and signature-verified ``kanban.complete_outcome``.
+    """
+    row = conn.execute(
+        "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise FactoryCompletionEvidenceError("factory outcome task does not exist")
+    _validate_factory_authority_envelope(
+        task_id,
+        str(row["idempotency_key"] or ""),
+        metadata,
+        authority_envelope,
+        actions,
+    )
+    row = _validate_factory_completion_evidence(conn, task_id, metadata)
+    expected_run_id = (
+        int(row["current_run_id"]) if row["current_run_id"] is not None else None
+    )
+    worker_pid = int(row["worker_pid"]) if row["worker_pid"] is not None else None
+    if worker_pid == os.getpid():
+        raise FactoryCompletionEvidenceError(
+            "canonical factory reconciliation cannot run inside the active worker"
+        )
+    reservation_lock = f"factory-completion:{secrets.token_hex(16)}"
+    with write_txn(conn):
+        reserved = conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = ?, claim_expires = ? "
+            "WHERE id = ? AND status = ? AND current_run_id IS ? "
+            "AND worker_pid IS ? AND claim_lock IS ?",
+            (
+                reservation_lock,
+                int(time.time()) + 300,
+                task_id,
+                row["status"],
+                row["current_run_id"],
+                row["worker_pid"],
+                row["claim_lock"],
+            ),
+        )
+        if reserved.rowcount != 1:
+            raise FactoryCompletionEvidenceError(
+                "factory outcome changed while completion was being reserved"
+            )
+        _append_event(
+            conn,
+            task_id,
+            "factory_completion_reserved",
+            {"status": "running"},
+            run_id=expected_run_id,
+        )
+    termination: Optional[dict[str, Any]] = None
+    if worker_pid is not None:
+        termination = _terminate_reclaimed_worker(worker_pid, row["claim_lock"])
+        if _worker_survived_termination(termination):
+            raise FactoryCompletionEvidenceError(
+                "active factory worker could not be terminated before completion"
+            )
+    completed = complete_task(
+        conn,
+        task_id,
+        result=result,
+        summary=summary,
+        metadata=metadata,
+        expected_run_id=expected_run_id,
+        fire_lifecycle_hook=fire_lifecycle_hook,
+        factory_authority_envelope=authority_envelope,
+        factory_actions=actions,
+        expected_claim_lock=reservation_lock,
+    )
+    if completed and termination is not None:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "factory_worker_terminated",
+                termination,
+                run_id=expected_run_id,
+            )
+    return completed
 
 
 # ---------------------------------------------------------------------------
