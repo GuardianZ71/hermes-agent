@@ -5446,6 +5446,10 @@ def _validate_factory_trust_path(path: Path) -> None:
         raise FactoryCompletionEvidenceError(
             "factory authority trust registry path must be absolute"
         )
+    if os.name != "posix":
+        raise FactoryCompletionEvidenceError(
+            "factory completion trust registry is not supported on this platform"
+        )
     current = path
     while True:
         try:
@@ -5741,6 +5745,7 @@ def complete_task(
     fire_lifecycle_hook: bool = True,
     factory_authority_envelope: Optional[Mapping[str, Any]] = None,
     factory_actions: Optional[Iterable[Mapping[str, Any]]] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5775,11 +5780,21 @@ def complete_task(
     and never blocks.
     """
     factory_row = conn.execute(
-        "SELECT body, created_by, idempotency_key FROM tasks WHERE id = ?",
+        "SELECT body, created_by, idempotency_key, status, current_run_id, claim_lock "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if _is_factory_outcome_row(factory_row):
         try:
+            if (
+                not expected_claim_lock
+                or not expected_claim_lock.startswith("factory-completion:")
+                or factory_row["status"] != "running"
+                or factory_row["claim_lock"] != expected_claim_lock
+            ):
+                raise FactoryCompletionRequiredError(
+                    "factory outcome completion requires an atomic reservation"
+                )
             _validate_factory_authority_envelope(
                 task_id,
                 str(factory_row["idempotency_key"] or ""),
@@ -5796,7 +5811,7 @@ def complete_task(
                     "completion_blocked_factory",
                     {
                         "reason": "canonical_factory_reconciliation_required",
-                        "summary_preview": (summary or result or "").strip().splitlines()[0][:200],
+                        "summary_preview": (summary or result or "").strip()[:200],
                     },
                     run_id=_current_run_id(conn, task_id),
                 )
@@ -5849,7 +5864,26 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
-        if expected_run_id is None:
+        if expected_claim_lock is not None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id IS ?
+                   AND claim_lock = ?
+                """,
+                (result, now, task_id, expected_run_id, expected_claim_lock),
+            )
+        elif expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6040,12 +6074,15 @@ def complete_factory_outcome(
         raise FactoryCompletionEvidenceError(
             "canonical factory reconciliation cannot run inside the active worker"
         )
+    reservation_lock = f"factory-completion:{secrets.token_hex(16)}"
     with write_txn(conn):
         reserved = conn.execute(
-            "UPDATE tasks SET status = 'review' "
+            "UPDATE tasks SET status = 'running', claim_lock = ?, claim_expires = ? "
             "WHERE id = ? AND status = ? AND current_run_id IS ? "
             "AND worker_pid IS ? AND claim_lock IS ?",
             (
+                reservation_lock,
+                int(time.time()) + 300,
                 task_id,
                 row["status"],
                 row["current_run_id"],
@@ -6061,7 +6098,7 @@ def complete_factory_outcome(
             conn,
             task_id,
             "factory_completion_reserved",
-            {"status": "review"},
+            {"status": "running"},
             run_id=expected_run_id,
         )
     termination: Optional[dict[str, Any]] = None
@@ -6081,6 +6118,7 @@ def complete_factory_outcome(
         fire_lifecycle_hook=fire_lifecycle_hook,
         factory_authority_envelope=authority_envelope,
         factory_actions=actions,
+        expected_claim_lock=reservation_lock,
     )
     if completed and termination is not None:
         with write_txn(conn):

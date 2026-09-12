@@ -213,14 +213,11 @@ def test_factory_trust_registry_rejects_user_owned_ancestry(tmp_path):
     registry.parent.mkdir(mode=0o700)
     registry.write_text("{}", encoding="utf-8")
     registry.chmod(0o400)
-    with pytest.raises(
-        kb.FactoryCompletionEvidenceError,
-        match="root-owned",
-    ):
+    with pytest.raises(kb.FactoryCompletionEvidenceError, match="root-owned"):
         kb._validate_factory_trust_path(registry)
 
 
-def test_factory_completion_reservation_rejects_racing_claim(
+def test_factory_completion_reservation_is_not_claimable(
     kanban_home, monkeypatch
 ):
     with kb.connect() as conn:
@@ -229,36 +226,65 @@ def test_factory_completion_reservation_rejects_racing_claim(
         envelope, actions = _signed_completion_authority(kanban_home, task_id, evidence)
         marker = kb._factory_delivery_checkpoint_marker(evidence["delivery_checkpoint"])
         kb.add_comment(conn, task_id, "polaris-software-factory", marker)
+        original_complete = kb.complete_task
+        claim_attempted = False
 
-        original_validate = kb._validate_factory_completion_evidence
-        raced = False
+        def complete_after_claim_attempt(check_conn, check_task_id, **kwargs):
+            nonlocal claim_attempted
+            claim_attempted = True
+            with kb.connect() as racing_conn:
+                assert kb.claim_task(
+                    racing_conn, check_task_id, claimer="racing-worker"
+                ) is None
+                assert kb.claim_review_task(
+                    racing_conn, check_task_id, claimer="racing-reviewer"
+                ) is None
+            return original_complete(check_conn, check_task_id, **kwargs)
 
-        def validate_then_claim(check_conn, check_task_id, metadata):
-            nonlocal raced
-            row = original_validate(check_conn, check_task_id, metadata)
-            if not raced:
-                raced = True
-                with kb.connect() as racing_conn:
-                    assert kb.claim_task(
-                        racing_conn, check_task_id, claimer="racing-worker"
-                    )
-            return row
+        monkeypatch.setattr(kb, "complete_task", complete_after_claim_attempt)
+        assert kb.complete_factory_outcome(
+            conn,
+            task_id,
+            metadata=evidence,
+            authority_envelope=envelope,
+            actions=actions,
+        )
+        assert claim_attempted
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "done"
+
+
+def test_factory_completion_final_write_cas_rejects_reservation_change(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        task_id = _factory_task(conn)
+        evidence = _completion_evidence(task_id)
+        envelope, actions = _signed_completion_authority(kanban_home, task_id, evidence)
+        marker = kb._factory_delivery_checkpoint_marker(evidence["delivery_checkpoint"])
+        kb.add_comment(conn, task_id, "polaris-software-factory", marker)
+        original_merge = kb._merge_completion_prose_artifacts
+
+        def tamper_with_reservation(*args, **kwargs):
+            with kb.connect() as racing_conn, kb.write_txn(racing_conn):
+                racing_conn.execute(
+                    "UPDATE tasks SET claim_lock = ? WHERE id = ?",
+                    ("racing-review-claim", task_id),
+                )
+            return original_merge(*args, **kwargs)
 
         monkeypatch.setattr(
-            kb, "_validate_factory_completion_evidence", validate_then_claim
+            kb, "_merge_completion_prose_artifacts", tamper_with_reservation
         )
-        with pytest.raises(
-            kb.FactoryCompletionEvidenceError,
-            match="changed while completion was being reserved",
-        ):
-            kb.complete_factory_outcome(
-                conn,
-                task_id,
-                metadata=evidence,
-                authority_envelope=envelope,
-                actions=actions,
-            )
+        assert not kb.complete_factory_outcome(
+            conn,
+            task_id,
+            metadata=evidence,
+            authority_envelope=envelope,
+            actions=actions,
+        )
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "running"
-        assert task.current_run_id is not None
+        assert task.claim_lock == "racing-review-claim"
