@@ -376,6 +376,7 @@ def native_dispatch(
             "HERMES_HOME",
             "HERMES_KANBAN_BOARD",
             "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_HOME",
         )
     }
     os.environ.pop("HERMES_PROFILE", None)
@@ -383,6 +384,7 @@ def native_dispatch(
     # canonical board explicitly and must not collapse all reads/admissions
     # onto that inherited path.
     os.environ.pop("HERMES_KANBAN_DB", None)
+    os.environ.pop("HERMES_KANBAN_HOME", None)
     os.environ.update({"HERMES_HOME": str(HOME), "HERMES_KANBAN_BOARD": slug})
     conn = None
     try:

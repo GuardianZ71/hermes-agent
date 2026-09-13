@@ -252,11 +252,13 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
     }
 
 
-def test_native_dispatch_ignores_inherited_task_db_override(monkeypatch, tmp_path):
+def test_native_dispatch_ignores_inherited_kanban_path_overrides(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     inherited = tmp_path / "wrong.db"
+    inherited_home = tmp_path / "wrong-home"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(inherited))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(inherited_home))
     captured = {}
 
     class Connection:
@@ -266,6 +268,7 @@ def test_native_dispatch_ignores_inherited_task_db_override(monkeypatch, tmp_pat
     def connect(*, board):
         captured["board"] = board
         captured["override_during_connect"] = os.environ.get("HERMES_KANBAN_DB")
+        captured["home_override_during_connect"] = os.environ.get("HERMES_KANBAN_HOME")
         return Connection()
 
     monkeypatch.setattr(kb, "connect", connect)
@@ -275,8 +278,13 @@ def test_native_dispatch_ignores_inherited_task_db_override(monkeypatch, tmp_pat
 
     mod.native_dispatch("surveyor", 1, True)
 
-    assert captured == {"board": "surveyor", "override_during_connect": None}
+    assert captured == {
+        "board": "surveyor",
+        "override_during_connect": None,
+        "home_override_during_connect": None,
+    }
     assert os.environ["HERMES_KANBAN_DB"] == str(inherited)
+    assert os.environ["HERMES_KANBAN_HOME"] == str(inherited_home)
 
 
 def test_busy_shared_admission_lock_is_retryable(monkeypatch):
