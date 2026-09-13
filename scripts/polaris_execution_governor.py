@@ -382,6 +382,8 @@ def native_dispatch(
             "HERMES_KANBAN_BOARD",
             "HERMES_KANBAN_DB",
             "HERMES_KANBAN_HOME",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_KANBAN_ATTACHMENTS_ROOT",
         )
     }
     os.environ.pop("HERMES_PROFILE", None)
@@ -390,6 +392,8 @@ def native_dispatch(
     # onto that inherited path.
     os.environ.pop("HERMES_KANBAN_DB", None)
     os.environ.pop("HERMES_KANBAN_HOME", None)
+    os.environ.pop("HERMES_KANBAN_WORKSPACES_ROOT", None)
+    os.environ.pop("HERMES_KANBAN_ATTACHMENTS_ROOT", None)
     os.environ.update({"HERMES_HOME": str(HOME), "HERMES_KANBAN_BOARD": slug})
     conn = None
     try:

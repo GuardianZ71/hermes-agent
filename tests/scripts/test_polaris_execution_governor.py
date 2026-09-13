@@ -257,8 +257,12 @@ def test_native_dispatch_ignores_inherited_kanban_path_overrides(monkeypatch, tm
 
     inherited = tmp_path / "wrong.db"
     inherited_home = tmp_path / "wrong-home"
+    inherited_workspaces = tmp_path / "wrong-workspaces"
+    inherited_attachments = tmp_path / "wrong-attachments"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(inherited))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(inherited_home))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(inherited_workspaces))
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(inherited_attachments))
     captured = {}
 
     class Connection:
@@ -269,6 +273,12 @@ def test_native_dispatch_ignores_inherited_kanban_path_overrides(monkeypatch, tm
         captured["board"] = board
         captured["override_during_connect"] = os.environ.get("HERMES_KANBAN_DB")
         captured["home_override_during_connect"] = os.environ.get("HERMES_KANBAN_HOME")
+        captured["workspaces_during_connect"] = os.environ.get(
+            "HERMES_KANBAN_WORKSPACES_ROOT"
+        )
+        captured["attachments_during_connect"] = os.environ.get(
+            "HERMES_KANBAN_ATTACHMENTS_ROOT"
+        )
         return Connection()
 
     monkeypatch.setattr(kb, "connect", connect)
@@ -282,9 +292,13 @@ def test_native_dispatch_ignores_inherited_kanban_path_overrides(monkeypatch, tm
         "board": "surveyor",
         "override_during_connect": None,
         "home_override_during_connect": None,
+        "workspaces_during_connect": None,
+        "attachments_during_connect": None,
     }
     assert os.environ["HERMES_KANBAN_DB"] == str(inherited)
     assert os.environ["HERMES_KANBAN_HOME"] == str(inherited_home)
+    assert os.environ["HERMES_KANBAN_WORKSPACES_ROOT"] == str(inherited_workspaces)
+    assert os.environ["HERMES_KANBAN_ATTACHMENTS_ROOT"] == str(inherited_attachments)
 
 
 def test_fleet_lock_path_ignores_inherited_kanban_roots(monkeypatch, tmp_path):

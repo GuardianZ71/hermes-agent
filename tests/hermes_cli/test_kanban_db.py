@@ -368,6 +368,36 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_uses_newest_run_id_when_end_times_tie(
+    kanban_home, monkeypatch,
+):
+    """Second-resolution ties cannot hide the newer rate-limit outcome."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="tied-runs", assignee="a")
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (tid, now - 10, now),
+        )
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'rate_limited', ?, ?)",
+            (tid, now - 5, now),
+        )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error='provider quota exhausted' WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb.time, "time", lambda: now + 100)
+
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+
 
 
 
