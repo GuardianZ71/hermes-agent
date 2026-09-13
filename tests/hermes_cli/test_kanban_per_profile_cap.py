@@ -188,6 +188,26 @@ def test_dispatch_allowlist_holds_tasks_promoted_during_the_tick(
     assert late in result.skipped_excluded
 
 
+def test_dispatch_can_disable_card_maintenance_for_dry_run(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Test")
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="pending", assignee="alpha")
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            maintenance=False,
+        )
+        assert kb.get_task(conn, task_id).status == "todo"
+    assert result.promoted == 0
+    assert result.spawned == []
+
+
 def test_empty_dispatch_allowlist_blocks_ready_and_review_lanes(
     isolated_kanban_home_with_profiles,
 ):
@@ -312,5 +332,26 @@ def test_canonical_db_path_override_cannot_disguise_board_as_default(
     assert explicit_default.skipped_excluded == [task_id]
     assert implicit_default.spawned == []
     assert implicit_default.skipped_excluded == [task_id]
+
+
+def test_unknown_connected_db_identity_cannot_claim_canonical_authority(
+    isolated_kanban_home_with_profiles, tmp_path,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="surveyor", name="Surveyor")
+    unknown_db = tmp_path / "unregistered" / "kanban.db"
+    with kb.connect_closing(db_path=unknown_db) as conn:
+        task_id = kb.create_task(conn, title="unknown-db", assignee="alpha")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            board="surveyor",
+            admitted_task_ids=[task_id],
+            admission_authority=kb.POLARIS_ADMISSION_AUTHORITY,
+        )
+
+    assert result.spawned == []
+    assert result.skipped_excluded == [task_id]
 
 

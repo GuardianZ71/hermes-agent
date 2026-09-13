@@ -879,6 +879,21 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
 
 
+def test_direct_claim_cannot_bypass_active_pr_guard(kanban_home):
+    """The atomic ready->running boundary blocks accidental duplicate writers."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="direct-claim", assignee="alice")
+        kb.add_comment(
+            conn,
+            task_id,
+            "worker",
+            "Opened https://github.com/example/repo/pull/48",
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.claim_task(conn, task_id, claimer="direct") is None
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
 def test_recent_success_bypassed_by_later_manual_promotion(kanban_home):
     """Manual promotion is an explicit rerun for recent-success guards too."""
     with kb.connect() as conn:

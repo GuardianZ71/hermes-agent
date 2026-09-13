@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -247,7 +248,35 @@ def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):
         "admitted_task_ids": ["t_three"],
         "admission_authority": mod.ADMISSION_AUTHORITY,
         "fleet_admission_lock_held": True,
+        "maintenance": False,
     }
+
+
+def test_native_dispatch_ignores_inherited_task_db_override(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    inherited = tmp_path / "wrong.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(inherited))
+    captured = {}
+
+    class Connection:
+        def close(self):
+            pass
+
+    def connect(*, board):
+        captured["board"] = board
+        captured["override_during_connect"] = os.environ.get("HERMES_KANBAN_DB")
+        return Connection()
+
+    monkeypatch.setattr(kb, "connect", connect)
+    monkeypatch.setattr(kb, "dispatch_once", lambda conn, **kwargs: kb.DispatchResult())
+    monkeypatch.setattr(mod, "board_dispatch_cap", lambda slug, slots: slots)
+    monkeypatch.setattr(mod, "admission_authority_errors", lambda root=mod.BOARD_ROOT: [])
+
+    mod.native_dispatch("surveyor", 1, True)
+
+    assert captured == {"board": "surveyor", "override_during_connect": None}
+    assert os.environ["HERMES_KANBAN_DB"] == str(inherited)
 
 
 def test_busy_shared_admission_lock_is_retryable(monkeypatch):

@@ -371,9 +371,18 @@ def native_dispatch(
 
     previous = {
         name: os.environ.get(name)
-        for name in ("HERMES_PROFILE", "HERMES_HOME", "HERMES_KANBAN_BOARD")
+        for name in (
+            "HERMES_PROFILE",
+            "HERMES_HOME",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_DB",
+        )
     }
     os.environ.pop("HERMES_PROFILE", None)
+    # Workers inherit a task-pinned DB path. The fleet authority selects each
+    # canonical board explicitly and must not collapse all reads/admissions
+    # onto that inherited path.
+    os.environ.pop("HERMES_KANBAN_DB", None)
     os.environ.update({"HERMES_HOME": str(HOME), "HERMES_KANBAN_BOARD": slug})
     conn = None
     try:
@@ -390,6 +399,7 @@ def native_dispatch(
             admitted_task_ids=sorted(set(admitted)),
             admission_authority=ADMISSION_AUTHORITY,
             fleet_admission_lock_held=True,
+            maintenance=not dry_run,
         )
         detail = asdict(result)
         return {

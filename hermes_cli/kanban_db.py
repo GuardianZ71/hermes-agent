@@ -4697,6 +4697,12 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # Enforce duplicate-writer protection at the atomic claim boundary,
+        # not only in the dispatcher loop.  Interactive and control-plane
+        # callers can claim directly, and an explicit continuation grant is
+        # consumed by the ``claimed`` event emitted below.
+        if _active_pr_guard_reason(conn, task_id) is not None:
+            return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -9430,6 +9436,42 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _active_pr_guard_reason(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
+) -> Optional[str]:
+    """Return ``active_pr`` unless a fresh continuation grant is available."""
+    if now is None:
+        now = int(time.time())
+    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_comment_at: Optional[int] = None
+    for c in conn.execute(
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
+        (task_id, pr_cutoff),
+    ).fetchall():
+        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            latest_pr_comment_at = int(c["created_at"] or 0)
+            break
+    if latest_pr_comment_at is None:
+        return None
+    latest_claim = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    latest_claim_id = int(latest_claim["id"]) if latest_claim else 0
+    continuation = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND created_at > ? AND id > ? "
+        "AND kind IN ('promoted_manual', 'unblocked', "
+        "'continuation_authorized', "
+        "'changes_requested', 'review_reopened') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, latest_pr_comment_at, latest_claim_id),
+    ).fetchone()
+    return None if continuation else "active_pr"
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9577,36 +9619,7 @@ def check_respawn_guard(
     #    Only a later explicit continuation/review/reclaim event authorizes one
     #    more claim. Generic status/dependency events are not evidence of that
     #    intent, and an authorization older than the latest claim is consumed.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    latest_pr_comment_at: Optional[int] = None
-    for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            latest_pr_comment_at = int(c["created_at"] or 0)
-            break
-    if latest_pr_comment_at is not None:
-        latest_claim = conn.execute(
-            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'claimed' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        latest_claim_id = int(latest_claim["id"]) if latest_claim else 0
-        continuation = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at > ? AND id > ? "
-            "AND kind IN ('promoted_manual', 'unblocked', "
-            "'continuation_authorized', "
-            "'changes_requested', 'review_reopened') "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, latest_pr_comment_at, latest_claim_id),
-        ).fetchone()
-        if not continuation:
-            return "active_pr"
-
-    return None
+    return _active_pr_guard_reason(conn, task_id, now=now)
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -9949,6 +9962,7 @@ def dispatch_once(
     excluded_task_ids: Optional[Iterable[str]] = None,
     admitted_task_ids: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
+    maintenance: bool = True,
     admission_authority: Optional[str] = None,
     fleet_admission_lock_held: bool = False,
 ) -> DispatchResult:
@@ -9973,7 +9987,7 @@ def dispatch_once(
     actual_db_path, actual_board = _connected_db_identity(conn)
     resolved_board = actual_board or requested_board or get_current_board()
     board_identity_mismatch = bool(
-        requested_board and actual_board and requested_board != actual_board
+        requested_board and actual_db_path is not None and actual_board != requested_board
     )
     configured_authority = str(
         read_board_metadata(resolved_board).get("admission_authority") or ""
@@ -10023,6 +10037,7 @@ def dispatch_once(
             excluded_task_ids=excluded_task_ids,
             admitted_task_ids=admitted_task_ids,
             reconcile_orphans=reconcile_orphans,
+            maintenance=maintenance,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -10055,6 +10070,7 @@ def dispatch_once(
                     excluded_task_ids=excluded_task_ids,
                     admitted_task_ids=admitted_task_ids,
                     reconcile_orphans=reconcile_orphans,
+                    maintenance=maintenance,
                 )
                 # Still under both locks: keep the occupancy read and the
                 # resulting claims atomic across every board in the fleet.
@@ -10083,6 +10099,7 @@ def _dispatch_once_locked(
     excluded_task_ids: Optional[Iterable[str]] = None,
     admitted_task_ids: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
+    maintenance: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10122,40 +10139,42 @@ def _dispatch_once_locked(
     maintenance and promotion to both ready and review lanes. Passing an empty
     iterable therefore runs maintenance without admitting any worker, while
     ``None`` preserves normal dispatch behavior.
+    ``maintenance=False`` skips every card-repair/promotion step; this is used
+    by the fleet governor to make its reporting dry-run non-mutating.
     """
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
-
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
-    if reconcile_orphans:
-        # Orphaned-card reconciliation: requeue 'running' cards whose claim
-        # bookkeeping is broken (no valid claim, dead/gone worker) that the
-        # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
-        result.reconciled_orphans = reconcile_orphaned_running(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
-    if _crash_auto_blocked:
-        result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    if maintenance:
+        # Reap zombie children from previously spawned workers. See
+        # reap_worker_zombies() for the full rationale.
+        reap_worker_zombies()
+        result.reclaimed = release_stale_claims(conn)
+        if reconcile_orphans:
+            # Orphaned-card reconciliation: requeue 'running' cards whose claim
+            # bookkeeping is broken (no valid claim, dead/gone worker) that the
+            # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
+            result.reconciled_orphans = reconcile_orphaned_running(conn)
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
+        # detect_crashed_workers stashes protocol-violation auto-blocks on
+        # itself so the public list-return stays stable. Pull them into the
+        # DispatchResult here so telemetry / tests see the trip.
+        _crash_auto_blocked = getattr(
+            detect_crashed_workers, "_last_auto_blocked", []
+        )
+        if _crash_auto_blocked:
+            result.auto_blocked.extend(_crash_auto_blocked)
+        # Rate-limited requeues (quota wall, no failure counted) — surface for
+        # telemetry / tests. These tasks went back to ``ready`` and the respawn
+        # guard will defer them until the quota window clears.
+        _crash_rate_limited = getattr(
+            detect_crashed_workers, "_last_rate_limited", []
+        )
+        if _crash_rate_limited:
+            result.rate_limited.extend(_crash_rate_limited)
+        result.timed_out = enforce_max_runtime(conn)
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
