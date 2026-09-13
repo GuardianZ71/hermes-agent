@@ -9987,7 +9987,11 @@ def dispatch_once(
     actual_db_path, actual_board = _connected_db_identity(conn)
     resolved_board = actual_board or requested_board or get_current_board()
     board_identity_mismatch = bool(
-        requested_board and actual_db_path is not None and actual_board != requested_board
+        actual_db_path is not None
+        and (
+            actual_board is None
+            or (requested_board is not None and actual_board != requested_board)
+        )
     )
     configured_authority = str(
         read_board_metadata(resolved_board).get("admission_authority") or ""

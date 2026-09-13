@@ -335,7 +335,7 @@ def test_canonical_db_path_override_cannot_disguise_board_as_default(
 
 
 def test_unknown_connected_db_identity_cannot_claim_canonical_authority(
-    isolated_kanban_home_with_profiles, tmp_path,
+    isolated_kanban_home_with_profiles, tmp_path, monkeypatch,
 ):
     kb = isolated_kanban_home_with_profiles
     kb.create_board(slug="surveyor", name="Surveyor")
@@ -350,8 +350,18 @@ def test_unknown_connected_db_identity_cannot_claim_canonical_authority(
             admitted_task_ids=[task_id],
             admission_authority=kb.POLARIS_ADMISSION_AUTHORITY,
         )
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "surveyor")
+        implicit = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            admitted_task_ids=[task_id],
+            admission_authority=kb.POLARIS_ADMISSION_AUTHORITY,
+        )
 
     assert result.spawned == []
     assert result.skipped_excluded == [task_id]
+    assert implicit.spawned == []
+    assert implicit.skipped_excluded == [task_id]
 
 
