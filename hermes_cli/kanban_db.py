@@ -9984,13 +9984,14 @@ def dispatch_once(
     cross-platform mechanics.
     """
     requested_board = _normalize_board_slug(board) if board else None
+    selected_board = requested_board or get_current_board()
     actual_db_path, actual_board = _connected_db_identity(conn)
-    resolved_board = actual_board or requested_board or get_current_board()
+    resolved_board = actual_board or selected_board
     board_identity_mismatch = bool(
         actual_db_path is not None
         and (
             actual_board is None
-            or (requested_board is not None and actual_board != requested_board)
+            or actual_board != selected_board
         )
     )
     configured_authority = str(

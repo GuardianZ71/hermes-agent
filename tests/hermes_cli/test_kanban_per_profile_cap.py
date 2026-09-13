@@ -365,3 +365,25 @@ def test_unknown_connected_db_identity_cannot_claim_canonical_authority(
     assert implicit.skipped_excluded == [task_id]
 
 
+def test_implicit_canonical_selection_rejects_known_different_connection(
+    isolated_kanban_home_with_profiles, monkeypatch,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Default")
+    kb.create_board(slug="surveyor", name="Surveyor")
+    default_db = kb.kanban_db_path(board="default")
+    with kb.connect_closing(db_path=default_db) as conn:
+        task_id = kb.create_task(conn, title="wrong-connected-board", assignee="alpha")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "surveyor")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            admitted_task_ids=[task_id],
+            admission_authority=kb.POLARIS_ADMISSION_AUTHORITY,
+        )
+
+    assert result.spawned == []
+    assert result.skipped_excluded == [task_id]
+
+
