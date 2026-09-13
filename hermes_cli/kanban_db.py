@@ -4701,7 +4701,7 @@ def claim_task(
         # not only in the dispatcher loop.  Interactive and control-plane
         # callers can claim directly, and an explicit continuation grant is
         # consumed by the ``claimed`` event emitted below.
-        if _active_pr_guard_reason(conn, task_id) is not None:
+        if check_respawn_guard(conn, task_id) is not None:
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand

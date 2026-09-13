@@ -274,6 +274,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
 
     with kb.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
@@ -992,6 +993,44 @@ def test_respawn_guard_active_pr_continuation_is_consumed_by_claim(kanban_home):
             (task_id,),
         )
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_active_pr_continuation_rate_limit_retry_survives_consumed_grant(
+    kanban_home, monkeypatch,
+):
+    """An elapsed quota cooldown retries the same PR without a new grant."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="quota-retry", assignee="alice", initial_status="blocked"
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (task_id, "Opened https://github.com/example/repo/pull/49", now - 60),
+        )
+        promoted, reason = kb.promote_task(
+            conn, task_id, actor="test", reason="continue existing PR"
+        )
+        assert promoted, reason
+        first_claim = kb.claim_task(conn, task_id)
+        assert first_claim is not None
+        conn.execute(
+            "UPDATE task_runs SET status='done', outcome='rate_limited', ended_at=? "
+            "WHERE id=?",
+            (now - 10, first_claim.current_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "current_run_id=NULL, last_failure_error='provider quota exhausted' "
+            "WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+        monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "1")
+
+        assert kb.check_respawn_guard(conn, task_id) is None
+        assert kb.claim_task(conn, task_id) is not None
 
 
 def test_respawn_guard_generic_status_after_pr_does_not_authorize(kanban_home):
