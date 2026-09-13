@@ -42,6 +42,11 @@ def test_post_deploy_live_acceptance_is_not_downgraded_to_release():
     assert task("accept", title="Post-deploy live acceptance").stage == "live_acceptance"
 
 
+@pytest.mark.parametrize("title", ["Build release automation", "Fix deploy failure"])
+def test_build_titles_with_release_words_remain_build_stage(title):
+    assert task("build", title=title).stage == "build"
+
+
 def test_review_finding_remediation_remains_a_build_writer():
     item = task("fix", title="Remediate PR #315 review findings")
     assert item.stage == "build"

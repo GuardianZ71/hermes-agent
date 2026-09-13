@@ -398,6 +398,51 @@ def test_respawn_guard_uses_newest_run_id_when_end_times_tie(
         assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
 
 
+def test_auth_guard_allows_probe_after_cooldown(kanban_home, monkeypatch):
+    """Recovered credentials can retry and persistent failures reach the breaker."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="auth-retry", assignee="a")
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'crashed', ?, ?)",
+            (tid, now - 10, now),
+        )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error='authentication failed' WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(kb.time, "time", lambda: now + 100)
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+        monkeypatch.setattr(kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_recent_success_equal_timestamp_event_does_not_bypass(kanban_home):
+    """Second-resolution equality is not proof that rerun intent came later."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="success-tie", assignee="a")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (tid, now - 10, now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'promoted_manual', ?)",
+            (tid, now),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) == "recent_success"
+
+
 
 
 

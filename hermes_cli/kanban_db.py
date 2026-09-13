@@ -9578,10 +9578,17 @@ def check_respawn_guard(
         # crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. Quota / auth blocker: retrying immediately will not help. Defer for
+    #    one cooldown window, then permit a probe so recovered credentials can
+    #    make progress and persistent failures can reach the circuit breaker.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        ended_at = latest_run["ended_at"] if latest_run is not None else None
+        if (
+            ended_at is None
+            or (now - int(ended_at)) < _resolve_rate_limit_cooldown_seconds()
+        ):
+            return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
     # URL comment are the canonical *inputs* to a review handoff (worker
@@ -9606,7 +9613,7 @@ def check_respawn_guard(
         completed_at = int(recent_completed["ended_at"] or 0)
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
+            "WHERE task_id = ? AND created_at > ? "
             "AND kind IN ('status', 'promoted', 'promoted_manual', "
             "'unblocked', 'continuation_authorized') "
             "LIMIT 1",

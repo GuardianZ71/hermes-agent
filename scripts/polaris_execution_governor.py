@@ -81,7 +81,10 @@ class Task:
         text = self.text.lower()
         if re.search(r"\b(live acceptance|acceptance|live verify|verify live)\b", title):
             return "live_acceptance"
-        if re.search(r"\b(release|merge|deploy|promote)\b", title):
+        if re.search(
+            r"^(?:\[[^\]]+\]\s*)*(?:release|merge|deploy|promote)\b",
+            title,
+        ):
             return "release"
         if (
             "[review]" in title
