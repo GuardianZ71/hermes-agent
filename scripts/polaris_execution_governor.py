@@ -347,6 +347,11 @@ def board_dispatch_cap(slug: str, additional_slots: int, root: Path = BOARD_ROOT
     return max(1, running + max(0, int(additional_slots)))
 
 
+def fleet_admission_lock_path() -> Path:
+    """Return the one canonical lock path, independent of worker overrides."""
+    return HOME / "kanban" / ".fleet-admission"
+
+
 def native_dispatch(
     slug: str,
     slots: int,
@@ -538,7 +543,7 @@ def main() -> int:
         sys.path.insert(0, str(AGENT_ROOT))
     from hermes_cli import kanban_db as kb
 
-    fleet_key = kb.kanban_home() / "kanban" / ".fleet-admission"
+    fleet_key = fleet_admission_lock_path()
     with kb._dispatch_tick_lock(fleet_key, fail_closed=True) as held:
         if not held:
             # Event intake must retain its cursor and retry. Success here would

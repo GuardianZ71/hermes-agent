@@ -287,6 +287,17 @@ def test_native_dispatch_ignores_inherited_kanban_path_overrides(monkeypatch, tm
     assert os.environ["HERMES_KANBAN_HOME"] == str(inherited_home)
 
 
+def test_fleet_lock_path_ignores_inherited_kanban_roots(monkeypatch, tmp_path):
+    canonical_home = tmp_path / "canonical"
+    monkeypatch.setattr(mod, "HOME", canonical_home)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "wrong-profile"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "wrong-kanban"))
+
+    assert mod.fleet_admission_lock_path() == (
+        canonical_home / "kanban" / ".fleet-admission"
+    )
+
+
 def test_busy_shared_admission_lock_is_retryable(monkeypatch):
     from hermes_cli import kanban_db as kb
 
