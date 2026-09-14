@@ -527,6 +527,20 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
 DEFAULT_BOARD = "default"
 POLARIS_ADMISSION_AUTHORITY = "polaris-execution-governor-v1"
 POLARIS_CANONICAL_BOARDS = frozenset({"polaris-ops", "acqlens", "surveyor", "apex"})
+_POLARIS_OUTCOME_RE = re.compile(r"\[linear:(POL-\d+)\]", re.I)
+_POLARIS_OUTCOME_TITLE_RE = re.compile(r"^\s*\[(POL-\d+)\]\s+outcome\s*:", re.I)
+_POLARIS_ARTIFACT_EDGE_RE = re.compile(
+    r"\[dependency:artifact:([a-z0-9._/-]+)@sha256:([a-f0-9]{64})\]",
+    re.I,
+)
+_POLARIS_COLLISION_EDGE_RE = re.compile(
+    r"\[dependency:collision:([a-z0-9._/-]+)\]",
+    re.I,
+)
+_POLARIS_COLLISION_DOMAIN_RE = re.compile(r"\[collision-domain:([^\]]+)\]", re.I)
+_POLARIS_COLLISION_VALIDATION_ERROR = (
+    "cross-outcome collision dependency requires fleet-governor validation"
+)
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
@@ -3569,6 +3583,8 @@ def create_task(
                     ),
                 )
                 for pid in parents:
+                    _validate_polaris_dependency(conn, pid, task_id)
+                for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
@@ -3868,6 +3884,119 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
+def _polaris_task_flow_row(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT t.id,t.title,t.body,t.status,"
+        "COALESCE((SELECT group_concat(c.body,'\\n') FROM task_comments c "
+        "WHERE c.task_id=t.id),'') AS comments FROM tasks t WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+
+
+def _polaris_task_flow_text(row: sqlite3.Row) -> str:
+    return f"{row['title'] or ''}\n{row['body'] or ''}\n{row['comments'] or ''}"
+
+
+def _polaris_outcomes(row: sqlite3.Row) -> frozenset[str]:
+    text = _polaris_task_flow_text(row)
+    outcomes = {
+        match.group(1).upper()
+        for match in _POLARIS_OUTCOME_RE.finditer(text)
+    }
+    outcomes.update(
+        match.group(1).upper()
+        for match in _POLARIS_OUTCOME_TITLE_RE.finditer(str(row["title"] or ""))
+    )
+    return frozenset(outcomes)
+
+
+def _validate_polaris_dependency(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+) -> None:
+    """Reject cross-outcome gates lacking immutable or live lease evidence."""
+    error = _polaris_dependency_error(conn, parent_id, child_id)
+    if error is not None:
+        raise ValueError(error)
+
+
+def _polaris_dependency_error(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    canonical_board: Optional[str] = None,
+) -> Optional[str]:
+    _, board = _connected_db_identity(conn)
+    if canonical_board is not None:
+        if canonical_board not in POLARIS_CANONICAL_BOARDS:
+            raise ValueError(f"unknown canonical Polaris board: {canonical_board}")
+        board = canonical_board
+    if board not in POLARIS_CANONICAL_BOARDS:
+        return None
+    parent = _polaris_task_flow_row(conn, parent_id)
+    child = _polaris_task_flow_row(conn, child_id)
+    if parent is None or child is None:
+        return None
+    parent_outcomes = _polaris_outcomes(parent)
+    child_outcomes = _polaris_outcomes(child)
+    if len(parent_outcomes) > 1 or len(child_outcomes) > 1:
+        return "dependency task has ambiguous Polaris outcome identity"
+    if (
+        not parent_outcomes
+        or not child_outcomes
+        or parent_outcomes == child_outcomes
+    ):
+        return None
+
+    parent_text = _polaris_task_flow_text(parent)
+    child_text = _polaris_task_flow_text(child)
+
+    parent_artifacts = {
+        (match.group(1).lower(), match.group(2).lower())
+        for match in _POLARIS_ARTIFACT_EDGE_RE.finditer(parent_text)
+    }
+    child_artifacts = {
+        (match.group(1).lower(), match.group(2).lower())
+        for match in _POLARIS_ARTIFACT_EDGE_RE.finditer(child_text)
+    }
+    if parent_artifacts & child_artifacts:
+        return None
+
+    parent_leases = {
+        match.group(1).lower()
+        for match in _POLARIS_COLLISION_EDGE_RE.finditer(parent_text)
+    }
+    child_leases = {
+        match.group(1).lower()
+        for match in _POLARIS_COLLISION_EDGE_RE.finditer(child_text)
+    }
+    parent_domains = {
+        match.group(1).strip().lower()
+        for match in _POLARIS_COLLISION_DOMAIN_RE.finditer(parent_text)
+    }
+    child_domains = {
+        match.group(1).strip().lower()
+        for match in _POLARIS_COLLISION_DOMAIN_RE.finditer(child_text)
+    }
+    if parent_leases & child_leases & parent_domains & child_domains:
+        # One board connection cannot prove fleet-wide exclusivity. The
+        # governor evaluates these markers while holding the fleet admission
+        # lock; ordinary link writers therefore fail closed instead of
+        # admitting a lease that may already be held on another board.
+        return _POLARIS_COLLISION_VALIDATION_ERROR
+
+    return (
+        "cross-outcome dependency requires matching "
+        "[dependency:artifact:<name>@sha256:<digest>] evidence or an active "
+        "exclusive [dependency:collision:<domain>] lease"
+    )
+
+
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
@@ -3875,6 +4004,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        _validate_polaris_dependency(conn, parent_id, child_id)
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
@@ -3941,6 +4071,72 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
         recompute_ready(conn)
     return removed
+
+
+def unlink_invalid_polaris_dependency(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+) -> str:
+    """Atomically unlink a still-invalid Polaris edge, or retain new evidence."""
+    with write_txn(conn):
+        status = unlink_invalid_polaris_dependency_locked(conn, parent_id, child_id)
+    if status == "unlinked":
+        recompute_ready(conn)
+    return status
+
+
+def unlink_invalid_polaris_dependency_locked(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    fleet_collision_invalid: bool = False,
+    canonical_board: Optional[str] = None,
+) -> str:
+    """Unlink inside a caller-held write transaction after fleet validation."""
+    if not conn.in_transaction:
+        raise RuntimeError("Polaris dependency repair requires an active write transaction")
+    exists = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+        (parent_id, child_id),
+    ).fetchone()
+    if exists is None:
+        return "already_absent"
+    parent = _polaris_task_flow_row(conn, parent_id)
+    child = _polaris_task_flow_row(conn, child_id)
+    if (
+        parent is not None
+        and child is not None
+        and (
+            parent["status"] in {"done", "archived"}
+            or child["status"] in {"done", "archived"}
+        )
+    ):
+        return "retained_historical"
+    error = _polaris_dependency_error(
+        conn,
+        parent_id,
+        child_id,
+        canonical_board=canonical_board,
+    )
+    if error is None:
+        return "retained_valid"
+    if error == _POLARIS_COLLISION_VALIDATION_ERROR and not fleet_collision_invalid:
+        return "retained_unverified"
+    cur = conn.execute(
+        "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+        (parent_id, child_id),
+    )
+    if not cur.rowcount:
+        return "already_absent"
+    _append_event(
+        conn,
+        child_id,
+        "unlinked",
+        {"parent": parent_id, "child": child_id, "reason": error},
+    )
+    return "unlinked"
 
 
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
@@ -7493,6 +7689,7 @@ def decompose_triage_task(
             for p_idx in child.get("parents") or []:
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
+                _validate_polaris_dependency(conn, parent_id, child_id)
                 conn.execute(
                     "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
                     "VALUES (?, ?)",
@@ -7508,6 +7705,7 @@ def decompose_triage_task(
         # link root under every child. Cycle-free because the root is
         # only ever a child here, never a parent of children.
         for cid in child_ids:
+            _validate_polaris_dependency(conn, cid, task_id)
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
                 "VALUES (?, ?)",

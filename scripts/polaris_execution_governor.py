@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,10 +27,18 @@ AGENT_ROOT = _SOURCE_ROOT if (_SOURCE_ROOT / "hermes_cli").is_dir() else HOME / 
 PYTHON = HOME / "hermes-agent" / "venv" / "bin" / "python"
 ADMISSION_AUTHORITY = "polaris-execution-governor-v1"
 LINEAR_RE = re.compile(r"\[linear:(POL-\d+)\]", re.I)
+OUTCOME_TITLE_RE = re.compile(r"^\s*\[(POL-\d+)\]\s+outcome\s*:", re.I)
 COLLISION_RE = re.compile(r"\[collision-domain:([^\]]+)\]", re.I)
 PR_URL_RE = re.compile(r"https://github\.com/([^\s/]+/[^\s/]+)/pull/(\d+)", re.I)
 PR_NUMBER_RE = re.compile(r"\bPR\s*#(\d+)\b", re.I)
-EXPLICIT_EDGE_RE = re.compile(r"\[(?:dependency|edge):(artifact|collision)\]", re.I)
+ARTIFACT_EDGE_RE = re.compile(
+    r"\[dependency:artifact:([a-z0-9._/-]+)@sha256:([a-f0-9]{64})\]",
+    re.I,
+)
+COLLISION_EDGE_RE = re.compile(
+    r"\[dependency:collision:([a-z0-9._/-]+)\]",
+    re.I,
+)
 TERMINAL = frozenset({"done", "archived"})
 
 
@@ -71,9 +80,14 @@ class Task:
         return f"{self.title}\n{self.body}\n{self.comments}"
 
     @property
+    def outcomes(self) -> frozenset[str]:
+        values = {match.group(1).upper() for match in LINEAR_RE.finditer(self.text)}
+        values.update(match.group(1).upper() for match in OUTCOME_TITLE_RE.finditer(self.title))
+        return frozenset(values)
+
+    @property
     def outcome(self) -> str | None:
-        match = LINEAR_RE.search(self.text)
-        return match.group(1).upper() if match else None
+        return next(iter(self.outcomes)) if len(self.outcomes) == 1 else None
 
     @property
     def stage(self) -> str:
@@ -109,6 +123,27 @@ class Task:
         if self.outcome:
             domains.add(f"outcome:{self.outcome}")
         return tuple(sorted(domains))
+
+    @property
+    def artifact_dependencies(self) -> frozenset[tuple[str, str]]:
+        return frozenset(
+            (match.group(1).lower(), match.group(2).lower())
+            for match in ARTIFACT_EDGE_RE.finditer(self.text)
+        )
+
+    @property
+    def collision_dependencies(self) -> frozenset[str]:
+        return frozenset(
+            match.group(1).lower()
+            for match in COLLISION_EDGE_RE.finditer(self.text)
+        )
+
+    @property
+    def collision_domains(self) -> frozenset[str]:
+        return frozenset(
+            match.group(1).strip().lower()
+            for match in COLLISION_RE.finditer(self.text)
+        )
 
 
 def iso(epoch: float | None = None) -> str:
@@ -239,6 +274,37 @@ def _task_ref(task: Task) -> dict[str, Any]:
             "profile": task.assignee or None, "outcome": task.outcome, "stage": task.stage}
 
 
+def classify_cross_outcome_edge(
+    parent: Task,
+    child: Task,
+    active_collision_holders: dict[str, list[Task]],
+) -> tuple[str, dict[str, str] | None]:
+    """Require immutable shared bytes or one live exclusive collision holder."""
+    artifacts = sorted(parent.artifact_dependencies & child.artifact_dependencies)
+    if artifacts:
+        name, digest = artifacts[0]
+        return "immutable_artifact", {
+            "kind": "artifact",
+            "name": name,
+            "sha256": digest,
+        }
+
+    leases = sorted(
+        parent.collision_dependencies
+        & child.collision_dependencies
+        & parent.collision_domains
+        & child.collision_domains
+    )
+    for domain in leases:
+        holders = active_collision_holders.get(domain, [])
+        if parent.status == "running" and len(holders) == 1 and holders[0] == parent:
+            return "active_collision_lease", {
+                "kind": "collision",
+                "domain": domain,
+            }
+    return "unbound_cross_outcome", None
+
+
 def analyze(tasks: Iterable[Task], edges: Iterable[tuple[str, str, str]], unreadable: Iterable[str], policy: Policy) -> dict[str, Any]:
     task_list = list(tasks)
     unreadable_list = sorted(set(unreadable))
@@ -256,6 +322,15 @@ def analyze(tasks: Iterable[Task], edges: Iterable[tuple[str, str, str]], unread
             incidents.append({"id": f"profile-occupancy-over-cap:{profile}", "severity": "error", "profile": profile,
                               "current": current, "limit": policy.max_workers_per_profile,
                               "message": "Profile occupancy exceeds its fleet-wide limit; drain without killing healthy workers."})
+    ambiguous_tasks = [task for task in task_list if len(task.outcomes) > 1]
+    for task in ambiguous_tasks:
+        incidents.append({
+            "id": f"ambiguous-outcome:{task.board}:{task.task_id}",
+            "severity": "error",
+            "task": _task_ref(task),
+            "outcomes": sorted(task.outcomes),
+            "message": "Task has conflicting Polaris outcome identities; admission is held.",
+        })
 
     domain_writers: dict[str, list[Task]] = defaultdict(list)
     for task in active:
@@ -271,22 +346,49 @@ def analyze(tasks: Iterable[Task], edges: Iterable[tuple[str, str, str]], unread
                               "message": "Multiple active build writers share one collision domain."})
 
     by_id = {(task.board, task.task_id): task for task in task_list}
+    active_collision_holders: dict[str, list[Task]] = defaultdict(list)
+    for task in active:
+        for domain in task.collision_domains:
+            active_collision_holders[domain].append(task)
     cross_edges = []
+    repair_candidates = []
     for board, parent_id, child_id in edges:
         parent = by_id.get((board, parent_id))
         child = by_id.get((board, child_id))
-        if not parent or not child or not parent.outcome or not child.outcome or parent.outcome == child.outcome:
+        if not parent or not child:
             continue
-        explicit = bool(EXPLICIT_EDGE_RE.search(parent.text) or EXPLICIT_EDGE_RE.search(child.text))
+        ambiguous = len(parent.outcomes) > 1 or len(child.outcomes) > 1
+        if ambiguous:
+            classification, evidence = "ambiguous_outcome", None
+        elif not parent.outcome or not child.outcome or parent.outcome == child.outcome:
+            continue
+        else:
+            classification, evidence = classify_cross_outcome_edge(
+                parent,
+                child,
+                active_collision_holders,
+            )
         both_nonterminal = parent.status not in TERMINAL and child.status not in TERMINAL
+        repair_eligible = (
+            classification in {"unbound_cross_outcome", "ambiguous_outcome"}
+            and child.status not in TERMINAL
+            and parent.status not in TERMINAL
+        )
         edge = {"board": board, "parent": _task_ref(parent), "child": _task_ref(child),
-                "classification": "explicit_artifact_or_collision" if explicit else "unclassified_cross_outcome",
-                "bothNonterminal": both_nonterminal}
+                "classification": classification, "evidence": evidence,
+                "bothNonterminal": both_nonterminal, "repairEligible": repair_eligible}
         cross_edges.append(edge)
-        if not explicit:
+        if repair_eligible:
+            repair_candidates.append({
+                "board": board,
+                "parentId": parent_id,
+                "childId": child_id,
+                "reason": classification,
+            })
+        if classification in {"unbound_cross_outcome", "ambiguous_outcome"}:
             incidents.append({"id": f"cross-outcome:{board}:{parent_id}:{child_id}",
-                              "severity": "error" if both_nonterminal else "warning", **edge,
-                              "message": "Cross-outcome dependency must be classified as artifact/collision or removed manually."})
+                              "severity": "error" if repair_eligible else "warning", **edge,
+                              "message": "Cross-outcome dependency lacks matching immutable-artifact identity or an active exclusive collision lease."})
 
     stages = ("build", "exact_head_review", "release", "live_acceptance")
     outcomes: dict[str, list[Task]] = defaultdict(list)
@@ -313,12 +415,19 @@ def analyze(tasks: Iterable[Task], edges: Iterable[tuple[str, str, str]], unread
         chains.append({"outcome": outcome, "stages": stage_payload})
 
     held = []
+    held_ids = set()
+    for task in task_list:
+        if task.status in {"ready", "review"} and len(task.outcomes) > 1:
+            held.append({"task": _task_ref(task), "domains": ["ambiguous-outcome"]})
+            held_ids.add((task.board, task.task_id))
     occupied_domains = set(domain_writers)
     ready_writers = sorted(
         (task for task in task_list if task.status == "ready" and task.writer),
         key=lambda task: (-task.priority, task.created_at, task.task_id),
     )
     for task in ready_writers:
+        if (task.board, task.task_id) in held_ids:
+            continue
         conflicts = sorted(set(task.domains) & occupied_domains)
         if conflicts:
             held.append({"task": _task_ref(task), "domains": conflicts})
@@ -328,6 +437,7 @@ def analyze(tasks: Iterable[Task], edges: Iterable[tuple[str, str, str]], unread
             occupied_domains.update(task.domains)
     return {"readable": not unreadable_list, "incidents": incidents, "writerCollisions": writer_collisions,
             "crossOutcomeDependencies": cross_edges, "heldCandidates": held,
+            "dependencyRepairCandidates": repair_candidates,
             "occupancy": {"fleet": len(active), "fleetLimit": policy.max_background_workers,
                           "byProfile": dict(sorted(by_profile.items())), "perProfileLimit": policy.max_workers_per_profile},
             "outcomeChains": chains}
@@ -442,9 +552,150 @@ def native_dispatch(
                 os.environ[name] = value
 
 
+def repair_cross_outcome_edges(
+    candidates: Iterable[dict[str, str]],
+    root: Path = BOARD_ROOT,
+) -> list[dict[str, str]]:
+    """Idempotently remove unsafe gates under one fleet-wide DB snapshot."""
+    if str(AGENT_ROOT) not in sys.path:
+        sys.path.insert(0, str(AGENT_ROOT))
+    from hermes_cli import kanban_db as kb
+
+    results: list[dict[str, str]] = []
+    candidate_list = list(candidates)
+    for candidate in candidate_list:
+        board = candidate["board"]
+        parent_id = candidate["parentId"]
+        child_id = candidate["childId"]
+        if board not in BOARDS:
+            results.append({
+                "board": board,
+                "parentId": parent_id,
+                "childId": child_id,
+                "status": "error",
+                "error": "unknown canonical board",
+            })
+            continue
+        connections = {
+            slug: kb.connect(db_path=root / slug / "kanban.db")
+            for slug in BOARDS
+        }
+        status = "error"
+        error_text = ""
+        try:
+            with ExitStack() as stack:
+                # Enter the mutation target last so it commits first. The other
+                # three transactions are read-only locks; a later cleanup/check
+                # failure cannot make the target's durable result ambiguous.
+                lock_order = [slug for slug in BOARDS if slug != board] + [board]
+                for slug in lock_order:
+                    stack.enter_context(kb.write_txn(connections[slug]))
+                active_holders: dict[str, list[tuple[str, str]]] = defaultdict(list)
+                for holder_board, conn in connections.items():
+                    for row in conn.execute(
+                        "SELECT t.id,t.title,t.body,t.status,"
+                        "COALESCE((SELECT group_concat(c.body,'\\n') FROM task_comments c "
+                        "WHERE c.task_id=t.id),'') AS comments FROM tasks t "
+                        "WHERE t.status='running'"
+                    ):
+                        text = kb._polaris_task_flow_text(row)
+                        domains = {
+                            match.group(1).strip().lower()
+                            for match in COLLISION_RE.finditer(text)
+                        }
+                        for domain in domains:
+                            active_holders[domain].append((holder_board, str(row["id"])))
+
+                conn = connections[board]
+                error = kb._polaris_dependency_error(
+                    conn,
+                    parent_id,
+                    child_id,
+                    canonical_board=board,
+                )
+                status = "retained_unverified"
+                fleet_collision_invalid = False
+                if error == kb._POLARIS_COLLISION_VALIDATION_ERROR:
+                    parent = kb._polaris_task_flow_row(conn, parent_id)
+                    child = kb._polaris_task_flow_row(conn, child_id)
+                    if parent is not None and child is not None:
+                        parent_text = kb._polaris_task_flow_text(parent)
+                        child_text = kb._polaris_task_flow_text(child)
+                        leases = {
+                            match.group(1).lower()
+                            for match in COLLISION_EDGE_RE.finditer(parent_text)
+                        } & {
+                            match.group(1).lower()
+                            for match in COLLISION_EDGE_RE.finditer(child_text)
+                        }
+                        domains = {
+                            match.group(1).strip().lower()
+                            for match in COLLISION_RE.finditer(parent_text)
+                        } & {
+                            match.group(1).strip().lower()
+                            for match in COLLISION_RE.finditer(child_text)
+                        }
+                        valid = any(
+                            domain in leases
+                            and parent["status"] == "running"
+                            and active_holders.get(domain) == [(board, parent_id)]
+                            for domain in domains
+                        )
+                        if valid:
+                            status = "retained_valid"
+                        else:
+                            fleet_collision_invalid = True
+                    else:
+                        fleet_collision_invalid = True
+                if error != kb._POLARIS_COLLISION_VALIDATION_ERROR or fleet_collision_invalid:
+                    status = kb.unlink_invalid_polaris_dependency_locked(
+                        conn,
+                        parent_id,
+                        child_id,
+                        fleet_collision_invalid=fleet_collision_invalid,
+                        canonical_board=board,
+                    )
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {str(exc)[:160]}"
+        finally:
+            for conn in connections.values():
+                conn.close()
+
+        # A target commit can succeed before a read-only peer transaction's
+        # post-commit integrity check fails, while a failed target commit rolls
+        # its tentative unlink back. Read back the exact edge so the result
+        # reflects durable state in either case.
+        if error_text and status in {"error", "unlinked"}:
+            with kb.connect_closing(db_path=root / board / "kanban.db") as conn:
+                linked = conn.execute(
+                    "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+                    (parent_id, child_id),
+                ).fetchone()
+            if status == "unlinked" and linked is not None:
+                status = "error"
+            elif status == "error" and linked is None:
+                status = "already_absent"
+            elif status == "unlinked" and linked is None:
+                status = "unlinked"
+        if status == "unlinked":
+            with kb.connect_closing(db_path=root / board / "kanban.db") as conn:
+                kb.recompute_ready(conn)
+        result = {
+            "board": board,
+            "parentId": parent_id,
+            "childId": child_id,
+            "status": status,
+        }
+        if status == "error":
+            result["error"] = error_text
+        results.append(result)
+    return results
+
+
 def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: Policy = Policy(),
              usage: Usage | None = None, dry_run: bool = False,
-             dispatch: Callable[[str, int, bool, Iterable[str], Iterable[str], Policy], dict[str, Any]] = native_dispatch) -> dict[str, Any]:
+             dispatch: Callable[[str, int, bool, Iterable[str], Iterable[str], Policy], dict[str, Any]] = native_dispatch,
+             repair: Callable[[Iterable[dict[str, str]], Path], list[dict[str, str]]] = repair_cross_outcome_edges) -> dict[str, Any]:
     now = time.time()
     previous = load(state_path)
     current_usage = usage or cached_usage(previous, now, policy.usage_refresh_seconds) or fetch_usage()
@@ -452,6 +703,16 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
     tasks, edges, unreadable = read_fleet(root)
     unreadable.extend(admission_authority_errors(root))
     integrity = analyze(tasks, edges, unreadable, policy)
+    repair_candidates = integrity["dependencyRepairCandidates"]
+    repair_results: list[dict[str, str]] = []
+    if repair_candidates and not dry_run and not unreadable:
+        repair_results = repair(repair_candidates, root)
+        # Supported unlink lifecycle immediately recomputes ready state. Read
+        # it back before candidate selection so unrelated releases progress in
+        # the same admission tick instead of waiting behind the removed edge.
+        tasks, edges, unreadable = read_fleet(root)
+        unreadable.extend(admission_authority_errors(root))
+        integrity = analyze(tasks, edges, unreadable, policy)
     occupancy = integrity["occupancy"]
     actions: list[dict[str, Any]] = []
     admission_closed = bool(unreadable or occupancy["fleet"] >= capacity)
@@ -511,7 +772,13 @@ def run_once(*, root: Path = BOARD_ROOT, state_path: Path = STATE_PATH, policy: 
                "queuedReady": sum(1 for task in tasks if task.status == "ready"),
                "activeExecutions": [_task_ref(task) for task in tasks if task.status == "running"],
                "integrity": integrity, "outcomeChains": integrity["outcomeChains"],
-               "safeRepair": {"mode": "dispatch_exclusion", "mutatedCards": False},
+               "safeRepair": {
+                   "mode": "supported_dependency_unlink_and_dispatch_exclusion",
+                   "mutatedCards": False,
+                   "mutatedDependencies": any(item["status"] == "unlinked" for item in repair_results),
+                   "candidates": repair_candidates,
+                   "unlinked": repair_results,
+               },
                "actions": actions, "dryRun": dry_run}
     atomic_write(state_path, payload)
     return payload

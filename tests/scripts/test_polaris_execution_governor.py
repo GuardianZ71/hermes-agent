@@ -19,8 +19,9 @@ spec.loader.exec_module(mod)
 
 
 def task(task_id: str, *, board: str = "surveyor", title: str = "Build", body: str = "[linear:POL-1]",
-         assignee: str = "forge", status: str = "ready", priority: int = 0) -> mod.Task:
-    return mod.Task(board, task_id, title, body, assignee, status, priority, 1)
+         assignee: str = "forge", status: str = "ready", priority: int = 0,
+         comments: str = "") -> mod.Task:
+    return mod.Task(board, task_id, title, body, assignee, status, priority, 1, comments)
 
 
 def test_same_pr_multistage_chain_is_not_duplicate_writer():
@@ -40,6 +41,53 @@ def test_same_pr_multistage_chain_is_not_duplicate_writer():
 
 def test_post_deploy_live_acceptance_is_not_downgraded_to_release():
     assert task("accept", title="Post-deploy live acceptance").stage == "live_acceptance"
+
+
+def test_canonical_outcome_title_is_projected_without_linear_marker():
+    assert task("outcome", title="[POL-126] outcome: Remove radar veil", body="").outcome == "POL-126"
+
+
+def test_conflicting_outcome_markers_are_held_and_repaired():
+    tasks = [
+        task(
+            "ambiguous",
+            title="[linear:POL-126] Radar helper",
+            body="[linear:POL-135] Roads dependency",
+        ),
+        task("radar", title="[linear:POL-126] Release Radar", status="todo"),
+    ]
+
+    result = mod.analyze(
+        tasks,
+        [("surveyor", "ambiguous", "radar")],
+        [],
+        mod.Policy(),
+    )
+
+    assert tasks[0].outcome is None
+    assert result["crossOutcomeDependencies"][0]["classification"] == "ambiguous_outcome"
+    assert result["dependencyRepairCandidates"] == [{
+        "board": "surveyor",
+        "parentId": "ambiguous",
+        "childId": "radar",
+        "reason": "ambiguous_outcome",
+    }]
+    assert result["heldCandidates"][0]["domains"] == ["ambiguous-outcome"]
+    assert any(item["id"].startswith("ambiguous-outcome:") for item in result["incidents"])
+
+
+def test_ambiguous_review_task_is_held_from_admission(tmp_path: Path):
+    tasks = [task(
+        "review",
+        title="Review exact head",
+        body="[linear:POL-126] [linear:POL-135]",
+        status="review",
+    )]
+    analyzed = mod.analyze(tasks, [], [], mod.Policy())
+    assert analyzed["heldCandidates"] == [{
+        "task": mod._task_ref(tasks[0]),
+        "domains": ["ambiguous-outcome"],
+    }]
 
 
 @pytest.mark.parametrize("title", ["Build release automation", "Fix deploy failure"])
@@ -64,17 +112,304 @@ def test_cross_outcome_edges_surface_without_auto_repair():
     tasks = [task("parent", body="[linear:POL-144]", status="running"),
              task("child", body="[linear:POL-114]", status="todo")]
     result = mod.analyze(tasks, [("surveyor", "parent", "child")], [], mod.Policy())
-    assert result["crossOutcomeDependencies"][0]["classification"] == "unclassified_cross_outcome"
+    assert result["crossOutcomeDependencies"][0]["classification"] == "unbound_cross_outcome"
     assert result["crossOutcomeDependencies"][0]["bothNonterminal"] is True
     assert any(item["id"].startswith("cross-outcome:") for item in result["incidents"])
 
 
-def test_explicit_artifact_dependency_is_classified_not_incident():
+def test_archived_parent_cross_outcome_edge_is_historical_not_repairable():
+    parent = task("parent", body="[linear:POL-144]", status="archived")
+    child = task("child", body="[linear:POL-114]", status="ready")
+
+    result = mod.analyze(
+        [parent, child],
+        [("surveyor", "parent", "child")],
+        [],
+        mod.Policy(),
+    )
+
+    edge = result["crossOutcomeDependencies"][0]
+    assert edge["bothNonterminal"] is False
+    assert edge["repairEligible"] is False
+    assert result["dependencyRepairCandidates"] == []
+
+
+def test_label_only_artifact_dependency_is_not_concrete_evidence():
     tasks = [task("parent", body="[linear:POL-144] [dependency:artifact]"),
-             task("child", body="[linear:POL-114]")]
+             task("child", body="[linear:POL-114] [dependency:artifact]")]
     result = mod.analyze(tasks, [("surveyor", "parent", "child")], [], mod.Policy())
-    assert result["crossOutcomeDependencies"][0]["classification"] == "explicit_artifact_or_collision"
+    assert result["crossOutcomeDependencies"][0]["classification"] == "unbound_cross_outcome"
+    assert result["crossOutcomeDependencies"][0]["repairEligible"] is True
+
+
+def test_matching_immutable_artifact_identity_allows_cross_outcome_dependency():
+    marker = f"[dependency:artifact:roads.pmtiles@sha256:{'a' * 64}]"
+    tasks = [task("parent", body=f"[linear:POL-135] {marker}"),
+             task("child", title="Release Radar", body=f"[linear:POL-126] {marker}")]
+    result = mod.analyze(tasks, [("surveyor", "parent", "child")], [], mod.Policy())
+    edge = result["crossOutcomeDependencies"][0]
+    assert edge["classification"] == "immutable_artifact"
+    assert edge["evidence"] == {
+        "kind": "artifact",
+        "name": "roads.pmtiles",
+        "sha256": "a" * 64,
+    }
+    assert edge["repairEligible"] is False
     assert not any(item["id"].startswith("cross-outcome:") for item in result["incidents"])
+
+
+def test_matching_active_exclusive_collision_lease_allows_dependency():
+    lease = "surveyor-production-release"
+    marker = f"[dependency:collision:{lease}] [collision-domain:{lease}]"
+    tasks = [task("parent", body=f"[linear:POL-135] {marker}", status="running"),
+             task("child", title="Release Radar", body=f"[linear:POL-126] {marker}", status="todo")]
+    result = mod.analyze(tasks, [("surveyor", "parent", "child")], [], mod.Policy())
+    edge = result["crossOutcomeDependencies"][0]
+    assert edge["classification"] == "active_collision_lease"
+    assert edge["evidence"] == {"kind": "collision", "domain": lease}
+    assert edge["repairEligible"] is False
+
+
+def test_collision_marker_without_active_exclusive_holder_is_rejected():
+    lease = "surveyor-production-release"
+    marker = f"[dependency:collision:{lease}] [collision-domain:{lease}]"
+    tasks = [task("parent", body=f"[linear:POL-135] {marker}", status="blocked"),
+             task("other", body=f"[linear:POL-140] [collision-domain:{lease}]", status="running"),
+             task("child", title="Release Radar", body=f"[linear:POL-126] {marker}", status="todo")]
+    result = mod.analyze(tasks, [("surveyor", "parent", "child")], [], mod.Policy())
+    edge = result["crossOutcomeDependencies"][0]
+    assert edge["classification"] == "unbound_cross_outcome"
+    assert edge["repairEligible"] is True
+
+
+def test_radar_release_is_released_from_unrelated_roads_outcome(tmp_path: Path):
+    root = tmp_path / "boards"
+    for slug in mod.BOARDS:
+        conn = _make_board(root, slug)
+        conn.close()
+    conn = sqlite3.connect(root / "surveyor" / "kanban.db")
+    conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?)", (
+        "roads", "[linear:POL-135] Repair Roads lineage", "", "surveyor-agent", "running", 10, 1,
+    ))
+    conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?)", (
+        "radar", "Release Radar", "[linear:POL-126] Reuse unchanged Roads artifact", "surveyor-agent", "todo", 20, 2,
+    ))
+    conn.execute("INSERT INTO task_links VALUES (?,?)", ("roads", "radar"))
+    conn.commit(); conn.close()
+    repaired = []
+
+    def repair(candidates, repair_root):
+        repaired.extend(candidates)
+        conn = sqlite3.connect(repair_root / "surveyor" / "kanban.db")
+        conn.execute("DELETE FROM task_links WHERE parent_id=? AND child_id=?", ("roads", "radar"))
+        conn.execute("UPDATE tasks SET status='ready' WHERE id='radar'")
+        conn.commit(); conn.close()
+        return [{"board": "surveyor", "parentId": "roads", "childId": "radar", "status": "unlinked"}]
+
+    result = mod.run_once(
+        root=root,
+        state_path=tmp_path / "state.json",
+        usage=mod.Usage(True, 95, 5, None, "pro", mod.iso()),
+        dry_run=False,
+        dispatch=lambda *args: {"spawned": []},
+        repair=repair,
+    )
+
+    assert repaired == [{
+        "board": "surveyor", "parentId": "roads", "childId": "radar",
+        "reason": "unbound_cross_outcome",
+    }]
+    assert result["safeRepair"]["unlinked"] == [{
+        "board": "surveyor", "parentId": "roads", "childId": "radar", "status": "unlinked",
+    }]
+    assert next(task for task in result["outcomeChains"] if task["outcome"] == "POL-126")["stages"][2]["state"] == "pending"
+
+
+def test_dependency_repair_uses_idempotent_unlink_lifecycle(tmp_path: Path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "different-hermes-home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    root = tmp_path / "custom-polaris-boards"
+    db_path = root / "surveyor" / "kanban.db"
+    db_path.parent.mkdir(parents=True)
+    (db_path.parent / "board.json").write_text(json.dumps({"slug": "surveyor"}))
+    with kb.connect_closing(db_path=db_path) as conn:
+        parent = kb.create_task(conn, title="Roads")
+        child = kb.create_task(conn, title="Radar", parents=[parent])
+        kb.add_comment(conn, parent, "test", "[linear:POL-135]")
+        kb.add_comment(conn, child, "test", "[linear:POL-126]")
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None
+        assert child_task.status == "todo"
+    candidate = {
+        "board": "surveyor",
+        "parentId": parent,
+        "childId": child,
+        "reason": "unbound_cross_outcome",
+    }
+    for slug in mod.BOARDS:
+        with kb.connect_closing(db_path=root / slug / "kanban.db"):
+            pass
+
+    original_boundary = kb._execute_boundary_with_retry
+    failed_target_commit = False
+
+    def fail_one_target_commit(conn, sql):
+        nonlocal failed_target_commit
+        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+        if not failed_target_commit and sql == "COMMIT" and db_file.endswith("/surveyor/kanban.db"):
+            failed_target_commit = True
+            raise sqlite3.OperationalError("injected target commit failure")
+        return original_boundary(conn, sql)
+
+    monkeypatch.setattr(kb, "_execute_boundary_with_retry", fail_one_target_commit)
+    failed = mod.repair_cross_outcome_edges([candidate], root)
+    assert failed[0]["status"] == "error"
+    with kb.connect_closing(db_path=db_path) as conn:
+        assert kb.parent_ids(conn, child) == [parent]
+    monkeypatch.setattr(kb, "_execute_boundary_with_retry", original_boundary)
+
+    original_check = kb._check_file_length_invariant
+    failed_peer_check = False
+
+    def fail_one_read_only_peer_check(conn):
+        nonlocal failed_peer_check
+        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+        if not failed_peer_check and db_file.endswith("/apex/kanban.db"):
+            failed_peer_check = True
+            raise RuntimeError("injected read-only peer post-commit failure")
+        original_check(conn)
+
+    monkeypatch.setattr(kb, "_check_file_length_invariant", fail_one_read_only_peer_check)
+
+    first = mod.repair_cross_outcome_edges([candidate], root)
+    second = mod.repair_cross_outcome_edges([candidate], root)
+
+    assert first == [{
+        "board": "surveyor", "parentId": parent, "childId": child, "status": "unlinked",
+    }]
+    assert second == [{
+        "board": "surveyor", "parentId": parent, "childId": child, "status": "already_absent",
+    }]
+    with kb.connect_closing(db_path=db_path) as conn:
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None
+        assert child_task.status == "ready"
+        assert [event.kind for event in kb.list_events(conn, child)].count("unlinked") == 1
+
+
+def test_dependency_repair_revalidates_evidence_under_lock(tmp_path: Path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    root = tmp_path / "kanban" / "boards"
+    db_path = root / "surveyor" / "kanban.db"
+    db_path.parent.mkdir(parents=True)
+    (db_path.parent / "board.json").write_text(json.dumps({"slug": "surveyor"}))
+    marker = f"[dependency:artifact:roads.pmtiles@sha256:{'b' * 64}]"
+    with kb.connect_closing(db_path=db_path) as conn:
+        parent = kb.create_task(conn, title="Roads")
+        child = kb.create_task(conn, title="Radar", parents=[parent])
+        kb.add_comment(conn, parent, "test", f"[linear:POL-135] {marker}")
+        kb.add_comment(conn, child, "test", f"[linear:POL-126] {marker}")
+
+    candidate = {
+        "board": "surveyor",
+        "parentId": parent,
+        "childId": child,
+        "reason": "unbound_cross_outcome",
+    }
+    result = mod.repair_cross_outcome_edges([candidate], root)
+
+    assert result == [{
+        "board": "surveyor",
+        "parentId": parent,
+        "childId": child,
+        "status": "retained_valid",
+    }]
+    with kb.connect_closing(db_path=db_path) as conn:
+        assert kb.parent_ids(conn, child) == [parent]
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None
+        assert child_task.status == "todo"
+
+
+def test_dependency_repair_revalidates_terminal_status_under_lock(tmp_path: Path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    root = tmp_path / "kanban" / "boards"
+    db_path = root / "surveyor" / "kanban.db"
+    with kb.connect_closing(db_path=db_path) as conn:
+        parent = kb.create_task(conn, title="Roads")
+        child = kb.create_task(conn, title="Radar", parents=[parent])
+        kb.add_comment(conn, parent, "test", "[linear:POL-135]")
+        kb.add_comment(conn, child, "test", "[linear:POL-126]")
+        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (parent,))
+        conn.commit()
+
+    result = mod.repair_cross_outcome_edges([{
+        "board": "surveyor",
+        "parentId": parent,
+        "childId": child,
+        "reason": "unbound_cross_outcome",
+    }], root)
+
+    assert result == [{
+        "board": "surveyor",
+        "parentId": parent,
+        "childId": child,
+        "status": "retained_historical",
+    }]
+    with kb.connect_closing(db_path=db_path) as conn:
+        assert kb.parent_ids(conn, child) == [parent]
+
+
+@pytest.mark.parametrize(
+    ("second_holder", "expected_status", "expected_linked"),
+    [(False, "retained_valid", True), (True, "unlinked", False)],
+)
+def test_collision_repair_uses_fleet_wide_exclusive_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+    second_holder: bool,
+    expected_status: str,
+    expected_linked: bool,
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    root = tmp_path / "kanban" / "boards"
+    domain = "surveyor-release"
+    marker = f"[dependency:collision:{domain}] [collision-domain:{domain}]"
+    surveyor_db = root / "surveyor" / "kanban.db"
+    with kb.connect_closing(db_path=surveyor_db) as conn:
+        parent = kb.create_task(conn, title="Roads")
+        child = kb.create_task(conn, title="Radar", parents=[parent])
+        kb.add_comment(conn, parent, "test", f"[linear:POL-135] {marker}")
+        kb.add_comment(conn, child, "test", f"[linear:POL-126] {marker}")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (parent,))
+        conn.commit()
+    if second_holder:
+        with kb.connect_closing(db_path=root / "apex" / "kanban.db") as conn:
+            other = kb.create_task(conn, title="Other writer", body=f"[collision-domain:{domain}]")
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (other,))
+            conn.commit()
+
+    result = mod.repair_cross_outcome_edges([{
+        "board": "surveyor",
+        "parentId": parent,
+        "childId": child,
+        "reason": "unbound_cross_outcome",
+    }], root)
+
+    assert result[0]["status"] == expected_status
+    with kb.connect_closing(db_path=surveyor_db) as conn:
+        assert (parent in kb.parent_ids(conn, child)) is expected_linked
 
 
 def test_profile_occupancy_is_fleet_wide_and_overage_drains_without_kill():
@@ -208,7 +543,13 @@ def test_collision_exclusion_does_not_close_unrelated_admission(tmp_path: Path):
         "surveyor", 4, True, ["duplicate"], ["unrelated"], mod.Policy()
     )
     assert all(call[4] == [] for call in calls if call[0] != "surveyor")
-    assert result["safeRepair"] == {"mode": "dispatch_exclusion", "mutatedCards": False}
+    assert result["safeRepair"] == {
+        "mode": "supported_dependency_unlink_and_dispatch_exclusion",
+        "mutatedCards": False,
+        "mutatedDependencies": False,
+        "candidates": [],
+        "unlinked": [],
+    }
 
 
 def test_native_dispatch_pins_fleet_caps_and_exclusions(monkeypatch):

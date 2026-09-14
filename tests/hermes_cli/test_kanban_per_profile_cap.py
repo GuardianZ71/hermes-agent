@@ -262,6 +262,140 @@ def test_governed_board_admits_only_configured_authority(
     assert [row[0] for row in admitted.spawned] == [task_id]
 
 
+def _enroll_polaris_board(kb, slug="surveyor"):
+    kb.create_board(slug=slug, name=slug.title())
+    metadata = kb.read_board_metadata(slug)
+    metadata.pop("db_path", None)
+    metadata["admission_authority"] = kb.POLARIS_ADMISSION_AUTHORITY
+    kb.board_metadata_path(slug).write_text(json.dumps(metadata))
+
+
+def test_governed_board_rejects_unbound_cross_outcome_links(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    _enroll_polaris_board(kb)
+    with kb.connect_closing(board="surveyor") as conn:
+        roads = kb.create_task(conn, title="[POL-135] outcome: Repair Roads")
+        radar = kb.create_task(conn, title="[POL-126] outcome: Release Radar")
+
+        with pytest.raises(ValueError, match="cross-outcome dependency"):
+            kb.link_tasks(conn, roads, radar)
+        assert kb.parent_ids(conn, radar) == []
+        assert kb.get_task(conn, radar).status == "ready"
+
+        with pytest.raises(ValueError, match="cross-outcome dependency"):
+            kb.create_task(
+                conn,
+                title="[POL-126] outcome: Release Radar successor",
+                parents=[roads],
+            )
+        assert len(kb.list_tasks(conn)) == 2
+
+
+def test_governed_board_rejects_conflicting_outcome_markers(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    _enroll_polaris_board(kb)
+    with kb.connect_closing(board="surveyor") as conn:
+        ambiguous = kb.create_task(
+            conn,
+            title="[linear:POL-126] Radar helper",
+            body="[linear:POL-135] Roads dependency",
+        )
+        radar = kb.create_task(conn, title="[linear:POL-126] Release Radar")
+
+        with pytest.raises(ValueError, match="ambiguous Polaris outcome identity"):
+            kb.link_tasks(conn, ambiguous, radar)
+        assert kb.parent_ids(conn, radar) == []
+
+
+@pytest.mark.parametrize(
+    "children",
+    [
+        [
+            {"title": "[linear:POL-135] Roads", "assignee": "forge"},
+            {
+                "title": "[linear:POL-126] Radar",
+                "assignee": "forge",
+                "parents": [0],
+            },
+        ],
+        [{"title": "[linear:POL-135] Roads", "assignee": "forge"}],
+    ],
+)
+def test_governed_decomposition_rejects_cross_outcome_links_atomically(
+    isolated_kanban_home_with_profiles,
+    children,
+):
+    kb = isolated_kanban_home_with_profiles
+    _enroll_polaris_board(kb)
+    with kb.connect_closing(board="surveyor") as conn:
+        root = kb.create_task(
+            conn,
+            title="[linear:POL-126] Radar outcome",
+            triage=True,
+        )
+        with pytest.raises(ValueError, match="cross-outcome dependency"):
+            kb.decompose_triage_task(
+                conn,
+                root,
+                root_assignee="forge",
+                children=children,
+                author="test",
+            )
+        assert [task.id for task in kb.list_tasks(conn)] == [root]
+        assert kb.get_task(conn, root).status == "triage"
+
+
+def test_governed_board_accepts_matching_immutable_artifact_dependency(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    _enroll_polaris_board(kb)
+    marker = f"[dependency:artifact:roads.pmtiles@sha256:{'a' * 64}]"
+    with kb.connect_closing(board="surveyor") as conn:
+        roads = kb.create_task(
+            conn,
+            title="[linear:POL-135] Publish Roads",
+            body=marker,
+        )
+        radar = kb.create_task(
+            conn,
+            title="[linear:POL-126] Release Radar",
+            body=marker,
+            parents=[roads],
+        )
+
+        assert kb.parent_ids(conn, radar) == [roads]
+        assert kb.get_task(conn, radar).status == "todo"
+
+
+def test_governed_board_defers_collision_links_to_fleet_authority(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    _enroll_polaris_board(kb)
+    domain = "surveyor-release"
+    marker = f"[dependency:collision:{domain}] [collision-domain:{domain}]"
+    with kb.connect_closing(board="surveyor") as conn:
+        roads = kb.create_task(
+            conn,
+            title="[linear:POL-135] Roads",
+            body=marker,
+        )
+        radar = kb.create_task(
+            conn,
+            title="[linear:POL-126] Radar",
+            body=marker,
+        )
+
+        with pytest.raises(ValueError, match="fleet-governor validation"):
+            kb.link_tasks(conn, roads, radar)
+        assert kb.parent_ids(conn, radar) == []
+
+
 def test_canonical_polaris_board_without_authority_fails_closed(
     isolated_kanban_home_with_profiles, monkeypatch,
 ):
