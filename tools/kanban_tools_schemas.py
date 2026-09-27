@@ -438,6 +438,13 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "exists, return that task's id instead of creating "
                 "a duplicate. Useful for retry-safe automation."
         )),
+        "one_per_request": _prop("boolean", (
+                "If true, create at most one non-archived task for the "
+                "current inbound gateway message. Repeated calls for that "
+                "message return its task id. Requires a durable message id; "
+                "cannot be combined with idempotency_key. Omit for "
+                "orchestrator fan-out."
+        )),
         "max_runtime_seconds": _prop("integer", (
                 "Per-task runtime cap. When exceeded, the "
                 "dispatcher SIGTERMs the worker and re-queues the "

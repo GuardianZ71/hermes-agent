@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 
 import pytest
 
@@ -72,6 +73,63 @@ def worker_env(monkeypatch, tmp_path):
     # run-lifecycle tools can prove ownership (see test_unbound_worker_cannot_mutate_card).
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
+
+
+def test_one_per_request_reuses_card_only_for_same_inbound_message(monkeypatch, worker_env):
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools  # register the real tool
+    from tools.registry import registry
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    args = {"title": "direct work", "assignee": "peer", "one_per_request": True}
+
+    def create(message_id, *, one_per_request=True, profile="direct-profile"):
+        set_session_vars(
+            platform="telegram", chat_id="chat-42", thread_id="thread-7",
+            message_id=message_id, profile=profile,
+        )
+        try:
+            call_args = {**args, "one_per_request": one_per_request}
+            result = json.loads(registry.dispatch("kanban_create", call_args))
+            assert result.get("ok"), result
+            return result["task_id"]
+        finally:
+            reset_session_vars()
+
+    first = create("message-1")
+    assert create("message-1") == first
+    assert create("message-2") != first
+    assert create("message-1", profile="") != first  # HERMES_PROFILE fallback is a separate scope.
+    assert create("message-1", one_per_request=False) != first
+
+    with kbc.connect_closing() as conn:
+        key = conn.execute("SELECT idempotency_key FROM tasks WHERE id = ?", (first,)).fetchone()[0]
+    expected = sha256(b"direct-profile\0telegram\0chat-42\0thread-7\0message-1").hexdigest()
+    assert key == f"origin-request-v1:{expected}"
+    assert "chat-42" not in key and "message-1" not in key
+
+
+def test_one_per_request_requires_message_identity_and_rejects_explicit_key(monkeypatch, worker_env):
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from tools import kanban_tools  # register the real tool
+    from tools.registry import registry
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    set_session_vars(platform="telegram", chat_id="chat-42", message_id="")
+    args = {"title": "direct work", "assignee": "peer", "one_per_request": True}
+    try:
+        missing = json.loads(registry.dispatch("kanban_create", args))
+        assert "durable gateway message identity" in missing["error"]
+
+        conflicting = json.loads(registry.dispatch(
+            "kanban_create", {**args, "idempotency_key": "manual-key"},
+        ))
+        assert "idempotency_key" in conflicting["error"]
+        assert "one_per_request" in conflicting["error"]
+    finally:
+        reset_session_vars()
 
 
 def test_show_defaults_to_env_task_id(worker_env):

@@ -8,6 +8,7 @@ shlex quoting of JSON metadata, structured-JSON failures). Humans use CLI/dashbo
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -987,6 +988,24 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
+def _origin_request_idempotency_key() -> str:
+    """Derive a private, stable key from the current inbound gateway message."""
+    from gateway.session_context import get_session_env
+
+    profile = (get_session_env("HERMES_SESSION_PROFILE", "")
+               or os.environ.get("HERMES_PROFILE") or "default")
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+    _check(all((platform, chat_id, message_id)),
+           "one_per_request requires durable gateway message identity "
+           "(platform, chat id, and message id)")
+    identity = "\0".join((profile, platform, chat_id, thread_id, message_id))
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return f"origin-request-v1:{digest}"
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -1009,6 +1028,11 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    one_per_request = _parse_bool_arg(args, "one_per_request")
+    _check(not one_per_request or "idempotency_key" not in args,
+           "one_per_request cannot be combined with an explicit idempotency_key")
+    idempotency_key = (_origin_request_idempotency_key() if one_per_request
+                       else args.get("idempotency_key"))
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
@@ -1036,7 +1060,7 @@ def _handle_create(args: dict, **kw) -> str:
             board=args.get("board"),
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
-            idempotency_key=args.get("idempotency_key"),
+            idempotency_key=idempotency_key,
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
