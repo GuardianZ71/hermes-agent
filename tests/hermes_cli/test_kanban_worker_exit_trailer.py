@@ -88,17 +88,34 @@ def test_rate_limit_exit_spends_explicit_attempt_ceiling_before_dispatch(
     kanban_home, monkeypatch, all_assignees_spawnable, max_retries,
 ):
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    observed = []
+
+    def observe_exit(_hook, task_id, **_fields):
+        if _hook != "on_kanban_worker_exited":
+            return
+        with kbc.connect() as committed:
+            observed.append((task_id, kb.get_task(committed, task_id).status))
+
+    monkeypatch.setattr(kb, "_kanban_observer_consumed", lambda hook: hook == "on_kanban_worker_exited")
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", observe_exit)
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="bounded quota attempt", assignee="a", max_retries=max_retries)
         for attempt in range(max_retries):
             _dead_worker_with_log(conn, tid, 72000 + attempt, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
-            assert tid not in kbd.detect_crashed_workers(conn)
+            if attempt + 1 == max_retries:
+                result = kbd.dispatch_once(conn, spawn_fn=lambda *_args: pytest.fail("blocked task spawned"))
+                assert result.rate_limited == [tid]
+                assert result.auto_blocked == [tid]
+                assert result.crashed == []
+            else:
+                assert tid not in kbd.detect_crashed_workers(conn)
             task = kb.get_task(conn, tid)
             assert task.consecutive_failures == attempt + 1
             assert task.status == ("blocked" if attempt + 1 == max_retries else "ready")
 
         run = kb.latest_run(conn, tid)
         assert run.outcome == "rate_limited"
+        assert "without counting a failure" not in (run.error or "")
         assert run.metadata["exit_code"] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
         gave_up = conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
@@ -111,6 +128,55 @@ def test_rate_limit_exit_spends_explicit_attempt_ceiling_before_dispatch(
         assert not result.spawned and not spawned
         assert kb.claim_task(conn, tid) is None
         assert kb.get_task(conn, tid).status == "blocked"
+        assert observed == [(tid, "ready")] * (max_retries - 1) + [(tid, "blocked")]
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_bounded_rate_limit_reclaim_is_durable_before_next_process(
+    kanban_home, lane,
+):
+    """A dispatcher that dies as soon as reclaim commits must not lose the attempt."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="one quota attempt", assignee="a", max_retries=1)
+        if lane == "review":
+            implementation = kb.claim_task(conn, tid)
+            assert implementation is not None
+            assert kb.request_review(
+                conn, tid, summary="ready for review", reviewer="reviewer",
+                expected_run_id=implementation.current_run_id,
+            )
+            review = kb.claim_review_task(conn, tid)
+            assert review is not None
+            pid = 73002
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, worker_started_at=NULL, started_at=? WHERE id=?",
+                (pid, int(time.time()) - 120, tid),
+            )
+            conn.commit()
+            log = kb.worker_log_path(tid)
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE}\n")
+        else:
+            _dead_worker_with_log(conn, tid, 73001, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+
+        # This is the old process's final call: no in-memory accounting survives it.
+        sweep = kbd._reclaim_dead_workers(conn)
+        assert sweep.rate_limited == [tid]
+
+    with kbc.connect() as restarted:
+        task = kb.get_task(restarted, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        assert kb.claim_task(restarted, tid) is None
+        assert kb.claim_review_task(restarted, tid) is None
+        run = kb.latest_run(restarted, tid)
+        assert run.outcome == run.status == "rate_limited"
+        assert run.metadata["exit_code"] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        gave_up = restarted.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
+        ).fetchone()
+        assert gave_up is not None
+        assert kb._json_dict(gave_up["payload"])["retry_status"] == lane
 
 
 def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):

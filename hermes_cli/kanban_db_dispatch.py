@@ -1086,11 +1086,11 @@ def _classify_dead_worker_exit(
             protocol_violation=True,
         )
     if kind == "rate_limited":
-        # Quota wall — NOT a task failure. Release to the source phase and do
-        # NOT count a failure so a long quota window can't trip the breaker.
+        # A generic card does not spend the breaker budget; one with an explicit
+        # attempt ceiling does. The durable error must describe either case.
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
+            f"pid {pid} exited rate-limited (quota wall)",
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
@@ -1126,8 +1126,9 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
-    # ``(task_id, pid, claimer, dead_worker)``: accountable exits are processed
-    # after the txn via ``_record_task_failure`` (needs its own write_txn).
+    auto_blocked: list[str] = field(default_factory=list)
+    # ``(task_id, pid, claimer, dead_worker)``: crash accounting remains after
+    # reclaim; bounded rate limits are accounted within the reclaim txn.
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
     # Worker-exit observer payloads, fired only after every reclaim/accounting
     # txn has committed.
@@ -1187,7 +1188,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "retry_status": retry_status,
             })
             if dead.rate_limited or dead.protocol_violation:
-                # Stamp the error before the separate breaker transaction.
                 # Generic rate limits and below-budget protocol violations do
                 # not reach ``_record_task_failure``, but the board still needs
                 # the reason and the guard needs the quota diagnosis.
@@ -1198,7 +1198,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
                 if row["max_retries"] is not None:
-                    sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                    if _record_task_failure(
+                        conn, row["id"], error=dead.error_text, outcome="rate_limited",
+                        release_claim=False, end_run=False, allow_nested=True,
+                    ):
+                        sweep.auto_blocked.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1208,8 +1212,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count accountable worker exits against the breaker; return tripped ids.
 
-    Rate limits spend attempts only for cards with an explicit ``max_retries``;
-    generic cards keep retrying after cooldown without consuming the breaker.
     Protocol violations get a BOUNDED violation-only budget independent of
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
     systemic same-error crashes (>= 3 identical fingerprints this tick) and
@@ -1223,12 +1225,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
-        if dead.rate_limited:
-            tripped = _record_task_failure(
-                conn, tid, error=error_text, outcome="rate_limited",
-                release_claim=False, end_run=False,
-            )
-        elif dead.protocol_violation:
+        if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
             if trow is None:
@@ -1303,8 +1300,11 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     It spends an attempt only when the card has an explicit ``max_retries``.
     """
     sweep = _reclaim_dead_workers(conn, board=board)
-    # Outside the main txn: account crashes and bounded rate limits.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    # Crash accounting still runs separately; bounded quota attempts committed
+    # alongside their reclaim and cannot be lost if dispatch stops here.
+    auto_blocked = sweep.auto_blocked
+    if sweep.crash_details:
+        auto_blocked.extend(_account_crashes(conn, sweep.crash_details))
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # exits are not crashes, even when an explicit attempt budget is spent.
@@ -1353,6 +1353,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    allow_nested: bool = False,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1371,11 +1372,14 @@ def _record_task_failure(
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
+
+    ``allow_nested=True`` permits the DB-only bookkeeping to join a caller's
+    transaction; its savepoint does not commit until that transaction commits.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
-    with _kb.write_txn(conn):
+    with _kb.write_txn(conn, allow_nested=allow_nested):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
@@ -2159,8 +2163,8 @@ def _run_reclaim_phase(
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
     result.crashed = detect_crashed_workers(conn, board=board)
-    # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
-    # went back to ``ready`` and the respawn guard defers them until quota clears.
+    # Side-channel attributes (see detect_crashed_workers); bounded rate-limit
+    # exits may already be blocked, while generic ones await the cooldown.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
