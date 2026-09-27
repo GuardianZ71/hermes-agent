@@ -498,7 +498,7 @@ kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dep
 
 The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
 
-For **direct-delivery admission**, a request-facing software agent first checks for a matching active card, then makes exactly one `kanban_create` call for the whole outcome:
+For **direct-delivery admission**, a request-facing software agent first checks for a matching active card and reuses it. Only when none exists does it make one `kanban_create` call for the whole outcome:
 
 ```python
 kanban_create(
@@ -512,7 +512,7 @@ kanban_create(
 )
 ```
 
-`one_per_request` deduplicates direct admission by the originating gateway message; it is not for decomposition or fan-out. `max_retries=1` blocks the card after its first failed worker attempt. These fields do not add a model poller or retry loop. Generic orchestrators can still create intentional task graphs without `one_per_request`.
+`one_per_request` deduplicates direct admission by the originating gateway message; it is not for decomposition or fan-out. It requires durable gateway message identity and deduplicates only non-archived cards on the same board; archiving permits recreation. `max_retries=1` blocks the card after its first failed worker attempt. These fields do not add a model poller or retry loop. Generic orchestrators can still create intentional task graphs without `one_per_request`.
 
 ### Why tools instead of shelling to `hermes kanban`
 
