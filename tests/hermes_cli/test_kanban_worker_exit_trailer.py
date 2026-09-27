@@ -83,6 +83,36 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
             assert run["outcome"] == "rate_limited"
 
 
+@pytest.mark.parametrize("max_retries", [1, 2])
+def test_rate_limit_exit_spends_explicit_attempt_ceiling_before_dispatch(
+    kanban_home, monkeypatch, all_assignees_spawnable, max_retries,
+):
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="bounded quota attempt", assignee="a", max_retries=max_retries)
+        for attempt in range(max_retries):
+            _dead_worker_with_log(conn, tid, 72000 + attempt, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+            assert tid not in kbd.detect_crashed_workers(conn)
+            task = kb.get_task(conn, tid)
+            assert task.consecutive_failures == attempt + 1
+            assert task.status == ("blocked" if attempt + 1 == max_retries else "ready")
+
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "rate_limited"
+        assert run.metadata["exit_code"] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        gave_up = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
+        ).fetchone()
+        assert gave_up is not None
+        assert kb._json_dict(gave_up["payload"])["trigger_outcome"] == "rate_limited"
+
+        spawned = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, _workspace: spawned.append(task.id))
+        assert not result.spawned and not spawned
+        assert kb.claim_task(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
 def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
     """The third consecutive clean exit trips the violation budget and ``recompute_ready``
     must not promote the card back the same tick (``consecutive_failures`` is still below
