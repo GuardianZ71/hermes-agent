@@ -450,6 +450,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "dispatcher SIGTERMs the worker and re-queues the "
                 "task with outcome='timed_out'."
         )),
+        "max_retries": _prop("integer", (
+                "Consecutive-failure ceiling for this task. Set to 1 to block "
+                "after the first failed attempt and prevent an automatic retry."
+        )),
         "initial_status": {
             "type": "string",
             "enum": ["running", "blocked"],

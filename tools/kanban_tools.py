@@ -1031,6 +1031,9 @@ def _handle_create(args: dict, **kw) -> str:
     one_per_request = _parse_bool_arg(args, "one_per_request")
     _check(not one_per_request or "idempotency_key" not in args,
            "one_per_request cannot be combined with an explicit idempotency_key")
+    max_retries = _opt_int(args.get("max_retries"))
+    if max_retries is not None and max_retries < 1:
+        return tool_error("max_retries must be >= 1", ok=False)
     idempotency_key = (_origin_request_idempotency_key() if one_per_request
                        else args.get("idempotency_key"))
     with _board(args.get("board")) as (kb, conn):
@@ -1062,6 +1065,7 @@ def _handle_create(args: dict, **kw) -> str:
             creator_task_id=self_tid,
             idempotency_key=idempotency_key,
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+            max_retries=_opt_int(args.get("max_retries")),
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),

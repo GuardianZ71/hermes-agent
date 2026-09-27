@@ -638,6 +638,31 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_persists_max_retries_one_attempt_limit(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
+
+    assert KANBAN_CREATE_SCHEMA["parameters"]["properties"]["max_retries"]["type"] == "integer"
+    result = json.loads(kt._handle_create({
+        "title": "one attempt", "assignee": "peer", "max_retries": 1,
+    }))
+    assert result["ok"] is True, result
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, result["task_id"]).max_retries == 1
+
+
+def test_create_rejects_zero_max_retries(worker_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "invalid attempt limit", "assignee": "peer", "max_retries": 0,
+    }))
+    assert result["ok"] is False
+    assert "max_retries must be >= 1" in result["error"]
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(
