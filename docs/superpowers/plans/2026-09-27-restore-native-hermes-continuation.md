@@ -272,7 +272,7 @@ git commit -m "fix(kanban): make idempotent card creation atomic"
 - Modify: `website/docs/user-guide/features/kanban.md`
 - Modify: `docs/superpowers/specs/2026-09-27-restore-native-hermes-continuation-design.md`
 
-- [ ] **Step 1: Update the tool table and examples**
+- [x] **Step 1: Update the tool table and examples**
 
 Document that a request-facing software agent uses one call with:
 
@@ -290,11 +290,11 @@ kanban_create(
 
 State explicitly that `one_per_request` is for admission, not decomposition; `max_retries=1` blocks after the first failure; and neither option adds a model poller or retry loop.
 
-- [ ] **Step 2: Add a short implementation note to the approved design**
+- [x] **Step 2: Add a short implementation note to the approved design**
 
 Record the exact config posture and tool fields selected during code inspection. Do not expand the design into an operations manual.
 
-- [ ] **Step 3: Check for contradictory language**
+- [x] **Step 3: Check for contradictory language**
 
 ```bash
 rg -n "one_per_request|max_retries=1|review_dispatch|auto_decompose|model poll" \
@@ -304,7 +304,7 @@ rg -n "one_per_request|max_retries=1|review_dispatch|auto_decompose|model poll" 
 
 Expected: every required boundary is present and no passage tells direct-delivery agents to fan out.
 
-- [ ] **Step 4: Commit the docs**
+- [x] **Step 4: Commit the docs**
 
 ```bash
 git add website/docs/user-guide/features/kanban.md
