@@ -724,19 +724,16 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     error=error, metadata=payload,
                 )
                 _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
+                _record_task_failure(
+                    conn, tid,
+                    error=error,
+                    outcome="timed_out",
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+                    allow_nested=True,
+                )
                 timed_out.append(tid)
-        # Outside the write_txn above because ``_record_task_failure`` opens its
-        # own. If the breaker trips this flips the task to ``blocked`` and emits
-        # ``gave_up`` on top of the ``timed_out`` already emitted.
-        if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=error,
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
-            )
     return timed_out
 
 
@@ -1127,11 +1124,10 @@ class _CrashSweep:
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
     auto_blocked: list[str] = field(default_factory=list)
-    # ``(task_id, pid, claimer, dead_worker)``: crash accounting remains after
-    # reclaim; bounded rate limits are accounted within the reclaim txn.
+    # Kept until all exits are classified, so systemic fingerprint counts are
+    # calculated across the full batch before the reclaim transaction commits.
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
-    # Worker-exit observer payloads, fired only after every reclaim/accounting
-    # txn has committed.
+    # Worker-exit observer payloads, fired only after reclaim commits.
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
@@ -1206,10 +1202,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+        if sweep.crash_details:
+            sweep.auto_blocked.extend(_account_crashes(conn, sweep.crash_details, allow_nested=True))
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(
+    conn: sqlite3.Connection, crash_details: list, *, allow_nested: bool = False,
+) -> list[str]:
     """Count accountable worker exits against the breaker; return tripped ids.
 
     Protocol violations get a BOUNDED violation-only budget independent of
@@ -1254,6 +1254,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                     "protocol_violations": streak,
                     "protocol_violation_limit": violation_limit,
                 },
+                allow_nested=allow_nested,
             )
         elif dead.terminal_provider:
             # A retry cannot heal a revoked credential or a missing model, so
@@ -1268,6 +1269,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
+                allow_nested=allow_nested,
             )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
@@ -1283,6 +1285,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
+                allow_nested=allow_nested,
             )
         if tripped:
             auto_blocked.append(tid)
@@ -1300,18 +1303,14 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     It spends an attempt only when the card has an explicit ``max_retries``.
     """
     sweep = _reclaim_dead_workers(conn, board=board)
-    # Crash accounting still runs separately; bounded quota attempts committed
-    # alongside their reclaim and cannot be lost if dispatch stops here.
     auto_blocked = sweep.auto_blocked
-    if sweep.crash_details:
-        auto_blocked.extend(_account_crashes(conn, sweep.crash_details))
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # exits are not crashes, even when an explicit attempt budget is spent.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
-    # Fired only now, after the reclaim txn AND breaker accounting have
-    # committed, so subscribers always observe fully durable board state.
+    # Fired only after the reclaim transaction commits, so subscribers observe
+    # both the released run and its breaker accounting.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
         _board = _kb.get_current_board()
         for hook_fields in sweep.exited_hook_payloads:

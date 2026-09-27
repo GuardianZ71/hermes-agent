@@ -179,6 +179,110 @@ def test_bounded_rate_limit_reclaim_is_durable_before_next_process(
         assert kb._json_dict(gave_up["payload"])["retry_status"] == lane
 
 
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("exit_code", [0, 1, kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE, "timeout"])
+def test_failed_worker_accounting_survives_reclaim_process_exit(
+    kanban_home, lane, exit_code,
+):
+    """One failed attempt and its closed run must commit together before the next dispatcher."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="one failed attempt", assignee="a", max_retries=1,
+            max_runtime_seconds=1 if exit_code == "timeout" else None,
+        )
+        implementation = kb.claim_task(conn, tid)
+        assert implementation is not None
+        if lane == "review":
+            assert kb.request_review(
+                conn, tid, summary="ready for review", reviewer="reviewer",
+                expected_run_id=implementation.current_run_id,
+            )
+            assert kb.claim_review_task(conn, tid) is not None
+        pid = 74001
+        started = int(time.time()) - 120
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, worker_started_at=NULL, started_at=? WHERE id=?",
+                (pid, started, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at=? WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)",
+                (started, tid),
+            )
+        if exit_code == "timeout":
+            assert kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None) == [tid]
+        else:
+            log = kb.worker_log_path(tid)
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(f"{KANBAN_WORKER_EXIT_TRAILER}{exit_code}\n")
+            assert kbd._reclaim_dead_workers(conn).crashed == [tid]
+
+    with kbc.connect() as restarted:
+        task = kb.get_task(restarted, tid)
+        assert (task.status, task.consecutive_failures) == ("blocked", 1)
+        assert kb.claim_task(restarted, tid) is None
+        assert kb.claim_review_task(restarted, tid) is None
+        run = restarted.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert run["outcome"] == ("timed_out" if exit_code == "timeout" else "crashed")
+        gave_up = restarted.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
+        ).fetchone()
+        assert gave_up is not None
+        assert kb._json_dict(gave_up["payload"])["retry_status"] == lane
+
+
+@pytest.mark.parametrize("exit_code", [1, "timeout"])
+def test_failed_worker_accounting_error_rolls_back_release_and_run(
+    kanban_home, monkeypatch, exit_code,
+):
+    """A failure after closing the run cannot leave a released task with no attempt spent."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="rollback failed attempt", assignee="a", max_retries=1,
+            max_runtime_seconds=1 if exit_code == "timeout" else None,
+        )
+        assert kb.claim_task(conn, tid) is not None
+        pid = 74002
+        started = int(time.time()) - 120
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, worker_started_at=NULL, started_at=? WHERE id=?",
+                (pid, started, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at=? WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)",
+                (started, tid),
+            )
+        if exit_code != "timeout":
+            log = kb.worker_log_path(tid)
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(f"{KANBAN_WORKER_EXIT_TRAILER}{exit_code}\n")
+        original_append = kb._append_event
+
+        def fail_gave_up(connection, task_id, kind, payload, **kwargs):
+            if kind == "gave_up":
+                raise RuntimeError("injected accounting failure")
+            return original_append(connection, task_id, kind, payload, **kwargs)
+
+        monkeypatch.setattr(kb, "_append_event", fail_gave_up)
+        with pytest.raises(RuntimeError, match="injected accounting failure"):
+            if exit_code == "timeout":
+                kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None)
+            else:
+                kbd._reclaim_dead_workers(conn)
+
+    with kbc.connect() as restarted:
+        task = kb.get_task(restarted, tid)
+        assert (task.status, task.consecutive_failures, task.worker_pid) == ("running", 0, pid)
+        assert kb.latest_run(restarted, tid).ended_at is None
+        kinds = [event.kind for event in kb.list_events(restarted, tid)]
+        assert "gave_up" not in kinds
+        assert "crashed" not in kinds
+        assert "timed_out" not in kinds
+
+
 def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
     """The third consecutive clean exit trips the violation budget and ``recompute_ready``
     must not promote the card back the same tick (``consecutive_failures`` is still below
