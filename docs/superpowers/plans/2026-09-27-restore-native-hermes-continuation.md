@@ -30,7 +30,7 @@
 - Modify: `tools/kanban_tools.py`
 - Test: `tests/tools/test_kanban_tools.py`
 
-- [ ] **Step 1: Write failing request-deduplication tests**
+- [x] **Step 1: Write failing request-deduplication tests**
 
 Add focused tests beside the existing `kanban_create` auto-subscribe coverage:
 
@@ -82,7 +82,7 @@ def test_create_one_per_request_requires_durable_message_identity(monkeypatch, w
     assert "message identity" in result["error"]
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm they fail**
+- [x] **Step 2: Run the focused tests and confirm they fail**
 
 Run:
 
@@ -93,7 +93,7 @@ python -m pytest tests/tools/test_kanban_tools.py -k 'one_per_request' -q
 
 Expected: the new tests fail because `one_per_request` is not declared or enforced.
 
-- [ ] **Step 3: Add the narrow tool option**
+- [x] **Step 3: Add the narrow tool option**
 
 In `KANBAN_CREATE_SCHEMA`, add:
 
@@ -125,7 +125,7 @@ def _origin_request_idempotency_key() -> str:
 
 In `_handle_create`, reject simultaneous explicit `idempotency_key` plus `one_per_request`, derive the key when requested, and pass it to `create_task`. Do not change default fan-out behavior; orchestrators that omit `one_per_request` can still intentionally create multiple children.
 
-- [ ] **Step 4: Run focused and neighboring tool tests**
+- [x] **Step 4: Run focused and neighboring tool tests**
 
 Run:
 
@@ -135,7 +135,7 @@ python -m pytest tests/tools/test_kanban_tools.py tests/tools/test_kanban_toolse
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit the verified slice**
+- [x] **Step 5: Commit the verified slice**
 
 ```bash
 git add tools/kanban_tools.py tools/kanban_tools_schemas.py tests/tools/test_kanban_tools.py
@@ -220,7 +220,7 @@ git commit -m "fix(kanban): honor per-card one-attempt limits"
 - Modify: `hermes_cli/kanban_db.py`
 - Test: `tests/hermes_cli/test_kanban_db.py`
 
-- [ ] **Step 1: Add a two-connection race test**
+- [x] **Step 1: Add a two-connection race test**
 
 Create a test that opens two independent connections to the same temporary Kanban database, synchronizes two threads with a barrier, and calls `create_task(..., idempotency_key="same-request")` concurrently. Assert both calls return the same task id and the database contains exactly one non-archived row with that key.
 
@@ -232,7 +232,7 @@ assert conn.execute(
 ).fetchone()[0] == 1
 ```
 
-- [ ] **Step 2: Run the race repeatedly and confirm it reproduces before the fix**
+- [x] **Step 2: Run the race repeatedly and confirm it reproduces before the fix**
 
 ```bash
 for run in 1 2 3 4 5; do
@@ -242,11 +242,11 @@ done
 
 Expected: at least one pre-fix run fails with two ids/rows. If SQLite scheduling does not reproduce it, preserve the barrier test and show by code inspection that the lookup remains outside `write_txn` before proceeding.
 
-- [ ] **Step 3: Move the idempotency lookup inside the write transaction**
+- [x] **Step 3: Move the idempotency lookup inside the write transaction**
 
 Remove the unlocked preflight lookup. At the start of each existing `with write_txn(conn, allow_nested=True):` block, perform the non-archived-key lookup and return the existing id before inserting. `BEGIN IMMEDIATE` then serializes the check-and-insert boundary without a new table, service, or lock file.
 
-- [ ] **Step 4: Run database and lifecycle verification**
+- [x] **Step 4: Run database and lifecycle verification**
 
 ```bash
 python -m pytest \
@@ -258,7 +258,7 @@ python -m pytest \
 
 Expected: all tests pass, including the repeated concurrent test.
 
-- [ ] **Step 5: Commit the verified slice**
+- [x] **Step 5: Commit the verified slice**
 
 ```bash
 git add hermes_cli/kanban_db.py tests/hermes_cli/test_kanban_db.py
