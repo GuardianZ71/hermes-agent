@@ -19,7 +19,7 @@ The request-facing Hermes agent remains the accountable owner. It admits at most
 1. A Hermes agent recognizes an unambiguous build, fix, or change request.
 2. It reconciles existing Linear work, branches, pull requests, active sessions, and Kanban cards before creating anything.
 3. If no matching active job exists, it creates exactly one durable card and records the originating session.
-4. One worker owns the outcome and continues within the same job. Context compression, a gateway restart, or a host restart must resume that job from its checkpoint rather than create another card.
+4. One worker owns the outcome and continues within the same job. Context compression and a gateway restart keep that worker alive. A host loss preserves the same card, worktree, and checkpoint but does not automatically start another model; an explicit unblock resumes the same card rather than creating a replacement.
 5. The worker develops and tests locally first on one branch.
 6. It requests one independent read-only review of the final exact head.
 7. It runs hosted CI only on that final reviewed head, using at most one pull request.
@@ -40,6 +40,7 @@ The request-facing Hermes agent remains the accountable owner. It admits at most
 - Allow one active worker per profile and one owner per outcome.
 - Do not enable automatic decomposition, review dispatch, proactive supervision, global backlog polling, or dispatcher-level automatic retries.
 - A worker may correct failures during its own active run. When the worker exits unsuccessfully, Hermes checkpoints the exact state and stops; it does not launch a fresh model automatically.
+- Native active-run ceilings are 20 model calls and eight hours for the request-facing software profiles. Direct-delivery cards also carry an eight-hour process cap and `max_retries=1`.
 - The deterministic external limiter enforces hard processed-token, attempt, and process-time ceilings. It can checkpoint and stop the existing job, but cannot call a model, create work, or retry.
 - Protected human gates remain limited to product or business judgment, spend, secrets, credentials, destructive data risk, force-push or history rewrite, live financial risk, irreversible infrastructure removal, legal commitments, or unavailable OS permissions.
 
@@ -70,7 +71,7 @@ Verification must prove behavior, not only configuration:
 1. A normal question creates no durable card.
 2. A clear small change creates exactly one card tied to its originating session.
 3. Repeated delivery of the same request does not create a second card.
-4. A gateway restart resumes the same card and session.
+4. A gateway restart leaves the same card and worker alive. Host loss preserves the same card/checkpoint and requires explicit unblock rather than automatic model respawn.
 5. A failed worker checkpoints and stops without automatic redispatch.
 6. The final-head review and CI occur once.
 7. The change merges, deploys, and passes a live acceptance check.
