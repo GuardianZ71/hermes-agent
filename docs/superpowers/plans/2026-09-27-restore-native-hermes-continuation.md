@@ -318,7 +318,7 @@ git commit -m "docs(POL-170): define direct Hermes admission"
 
 - Verify only; no new implementation unless a test or review finding requires correction.
 
-- [ ] **Step 1: Run the full relevant local suite**
+- [x] **Step 1: Run the full relevant local suite**
 
 ```bash
 source /Users/ops/.hermes/hermes-agent/venv/bin/activate
@@ -336,7 +336,7 @@ python -m pytest \
 
 Expected: zero failures.
 
-- [ ] **Step 2: Inspect the exact diff and freeze the candidate head**
+- [x] **Step 2: Inspect the exact diff and freeze the candidate head**
 
 ```bash
 git status --short
@@ -347,7 +347,7 @@ git rev-parse HEAD
 
 Expected: clean worktree; only the approved tool, ledger, tests, docs, design, and plan changed. Save the SHA as `REVIEWED_HEAD`.
 
-- [ ] **Step 3: Obtain one read-only independent exact-head review**
+- [x] **Step 3: Obtain one read-only independent exact-head review**
 
 Ask Forge to review `REVIEWED_HEAD` without editing, creating a card, branch, or PR. The review must cover request dedupe, concurrency, failure-stop behavior, existing fan-out compatibility, and test adequacy. A request-changes verdict returns findings to this branch; after local correction, repeat the read-only review on the new exact head.
 
