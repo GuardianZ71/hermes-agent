@@ -150,7 +150,7 @@ git commit -m "feat(kanban): dedupe direct work by inbound request"
 - Modify: `tools/kanban_tools.py`
 - Test: `tests/tools/test_kanban_tools.py`
 
-- [ ] **Step 1: Write the failing persistence test**
+- [x] **Step 1: Write the failing persistence test**
 
 ```python
 def test_create_persists_max_retries_one(worker_env):
@@ -172,7 +172,7 @@ def test_create_persists_max_retries_one(worker_env):
 
 Also add a validation test that `max_retries=0` returns `ok: false` with a clear error.
 
-- [ ] **Step 2: Run the focused tests and confirm failure**
+- [x] **Step 2: Run the focused tests and confirm failure**
 
 ```bash
 python -m pytest tests/tools/test_kanban_tools.py -k 'max_retries' -q
@@ -180,7 +180,7 @@ python -m pytest tests/tools/test_kanban_tools.py -k 'max_retries' -q
 
 Expected: the persistence assertion fails because `_handle_create` currently drops the argument.
 
-- [ ] **Step 3: Wire the existing database field through the tool**
+- [x] **Step 3: Wire the existing database field through the tool**
 
 Add this schema property:
 
@@ -193,7 +193,7 @@ Add this schema property:
 
 Validate `>= 1` in `_handle_create` and pass `max_retries=_opt_int(args.get("max_retries"))` to `kb.create_task`. Do not add a new limiter, daemon, or retry mechanism.
 
-- [ ] **Step 4: Prove the existing circuit breaker stops on the first failure**
+- [x] **Step 4: Prove the existing circuit breaker stops on the first failure**
 
 Run:
 
@@ -206,7 +206,7 @@ python -m pytest \
 
 Expected: all selected tests pass and the existing breaker lands the card in `blocked` after attempt one.
 
-- [ ] **Step 5: Commit the verified slice**
+- [x] **Step 5: Commit the verified slice**
 
 ```bash
 git add tools/kanban_tools.py tools/kanban_tools_schemas.py tests/tools/test_kanban_tools.py
