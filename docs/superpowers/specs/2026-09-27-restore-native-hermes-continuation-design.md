@@ -1,7 +1,7 @@
 # Restore Native Hermes Continuation — Design
 
-**Lane:** POL-170  
-**Status:** Approved direction 1  
+**Lane:** POL-170
+**Status:** Approved direction 1
 **Outcome:** Restore the useful autonomous behavior Hermes had before the software factory, without restoring ARES or any replacement orchestration framework.
 
 ## User outcome
