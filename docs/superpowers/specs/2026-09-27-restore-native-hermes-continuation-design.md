@@ -64,6 +64,8 @@ The intended live posture is:
 
 Any implementation must use existing Hermes extension points and configuration. A user-specific skill or prompt contract is preferred over widening Hermes core tools.
 
+**Implementation note:** On `default`, `acqlens-agent`, and `surveyor-agent`, set `kanban.dispatch_in_gateway`, `kanban.notify_in_gateway`, and `kanban.auto_subscribe_on_create` to `true`; set `kanban.review_dispatch` and `kanban.auto_decompose` to `false`; set `kanban.failure_limit`, `kanban.max_in_progress`, `kanban.max_in_progress_per_profile`, and `agent.api_max_retries` to `1`, `agent.max_turns` to `20`, `agent.run_budget_seconds` to `28800`, and `agent.auto_recovery_cycles` to `0`. After reconciling existing work, direct admission uses one `kanban_create` call with `title`, `assignee`, `body`, `one_per_request=True`, `max_retries=1`, `max_runtime_seconds=28800`, and `completion_contract="OWNER/REPO"`. The one-request key applies to admission, not decomposition; the first failed attempt blocks the card, with no model poller or retry loop.
+
 ## Verification
 
 Verification must prove behavior, not only configuration:
