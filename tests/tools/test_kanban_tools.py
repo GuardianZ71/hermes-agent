@@ -9,8 +9,6 @@ Verifies:
 from __future__ import annotations
 
 import json
-import os
-from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 
 import pytest
